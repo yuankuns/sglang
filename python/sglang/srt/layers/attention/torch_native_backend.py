@@ -47,6 +47,37 @@ class TorchNativeAttnBackend(AttentionBackend):
         k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
         return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
 
+    @staticmethod
+    def _make_relative_bias_mask(
+        rel_bias: torch.Tensor,
+        *,
+        kv_len: int,
+        query_offset,
+        causal: bool,
+        sliding_window_size: Optional[int],
+    ) -> torch.Tensor:
+        """Build an additive SDPA mask from Inkling's [q, h, distance] bias."""
+        q_len, num_heads, rel_extent = rel_bias.shape
+        q_pos = torch.arange(q_len, device=rel_bias.device) + query_offset
+        k_pos = torch.arange(kv_len, device=rel_bias.device)
+        rel_dist = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
+        rel_idx = rel_dist.clamp(min=0, max=rel_extent - 1)
+
+        bias_by_head = rel_bias.movedim(1, 0)
+        gather_idx = rel_idx.unsqueeze(0).expand(num_heads, -1, -1)
+        attn_mask = torch.gather(bias_by_head, dim=2, index=gather_idx)
+        valid_rel = (rel_dist >= 0) & (rel_dist < rel_extent)
+        attn_mask = attn_mask.masked_fill(~valid_rel.unsqueeze(0), 0)
+
+        allowed = torch.ones_like(rel_dist, dtype=torch.bool)
+        if causal:
+            allowed &= k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+        if sliding_window_size is not None and sliding_window_size > -1:
+            allowed &= k_pos.unsqueeze(0) >= (
+                q_pos.unsqueeze(1) - sliding_window_size
+            )
+        return attn_mask.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -75,6 +106,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
+        rel_bias: Optional[torch.Tensor] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -125,13 +157,6 @@ class TorchNativeAttnBackend(AttentionBackend):
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -145,20 +170,39 @@ class TorchNativeAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
-            attn_mask = None
-            is_causal = causal
-            if sliding_window_size is not None and sliding_window_size > -1:
-                attn_mask = self._make_sliding_window_mask(
-                    q_len=seq_len_kv,
+            if rel_bias is not None:
+                per_req_sdpa_query = per_req_query
+                attn_mask = self._make_relative_bias_mask(
+                    rel_bias[start_q:end_q],
                     kv_len=seq_len_kv,
+                    query_offset=prefill_seq_len_q,
+                    causal=causal,
                     sliding_window_size=sliding_window_size,
-                    device=per_req_query.device,
                 )
                 is_causal = False
+                output_start = 0
+            else:
+                per_req_sdpa_query = torch.empty(
+                    (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                    dtype=per_req_query.dtype,
+                    device=per_req_query.device,
+                )
+                per_req_sdpa_query[:, prefill_seq_len_q:, :] = per_req_query
+                attn_mask = None
+                is_causal = causal
+                if sliding_window_size is not None and sliding_window_size > -1:
+                    attn_mask = self._make_sliding_window_mask(
+                        q_len=seq_len_kv,
+                        kv_len=seq_len_kv,
+                        sliding_window_size=sliding_window_size,
+                        device=per_req_query.device,
+                    )
+                    is_causal = False
+                output_start = prefill_seq_len_q
 
-            per_req_out_redudant = (
+            per_req_out = (
                 scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
+                    per_req_sdpa_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
                     attn_mask=attn_mask,
@@ -169,7 +213,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :, :] = per_req_out[output_start:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -188,6 +232,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
+        rel_bias: Optional[torch.Tensor] = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -246,17 +291,27 @@ class TorchNativeAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
-            attn_mask = None
-            is_causal = causal
-            if sliding_window_size is not None and sliding_window_size > -1:
-                attn_mask = self._make_sliding_window_mask(
-                    q_len=seq_len_q,
+            if rel_bias is not None:
+                attn_mask = self._make_relative_bias_mask(
+                    rel_bias[start_q:end_q],
                     kv_len=seq_len_kv,
-                    sliding_window_size=sliding_window_size,
-                    device=per_req_query.device,
                     query_offset=seq_len_kv - seq_len_q,
+                    causal=causal,
+                    sliding_window_size=sliding_window_size,
                 )
                 is_causal = False
+            else:
+                attn_mask = None
+                is_causal = causal
+                if sliding_window_size is not None and sliding_window_size > -1:
+                    attn_mask = self._make_sliding_window_mask(
+                        q_len=seq_len_q,
+                        kv_len=seq_len_kv,
+                        sliding_window_size=sliding_window_size,
+                        device=per_req_query.device,
+                        query_offset=seq_len_kv - seq_len_q,
+                    )
+                    is_causal = False
 
             per_req_out = (
                 scaled_dot_product_attention(
@@ -284,6 +339,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        rel_bias=None,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -332,6 +388,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 and layer.sliding_window_size > -1
                 else None
             ),
+            rel_bias=rel_bias,
         )
         return o
 
@@ -343,6 +400,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        rel_bias=None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -393,6 +451,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 and layer.sliding_window_size > -1
                 else None
             ),
+            rel_bias=rel_bias,
         )
 
         return o

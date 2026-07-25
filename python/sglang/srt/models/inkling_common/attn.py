@@ -830,12 +830,18 @@ class InklingAttention(nn.Module):
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
         server_args = get_server_args()
-        assert server_args.attention_backend in ("fa4", "triton", "intel_xpu")
+        assert server_args.attention_backend in (
+            "fa4",
+            "triton",
+            "intel_xpu",
+            "torch_native",
+        )
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
         fa4 = server_args.attention_backend == "fa4"
         xpu_backend = server_args.attention_backend == "intel_xpu"
+        torch_native = server_args.attention_backend == "torch_native"
 
         rel_event = None
         prologue_did_store = False
@@ -1026,6 +1032,15 @@ class InklingAttention(nn.Module):
                 forward_batch,
                 rel_logits,
                 save_kv_cache=not prologue_did_store,
+            )
+        elif torch_native:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=not prologue_did_store,
+                rel_bias=rel_logits,
             )
         elif envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4:
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
