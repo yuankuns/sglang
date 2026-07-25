@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,6 +18,14 @@ from sglang.kernels.jit.utils import (
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+def _is_xpu_tensor(x: torch.Tensor) -> bool:
+    return getattr(x, "is_xpu", False)
+
+
+def _xpu_attn_prologue():
+    return importlib.import_module("sgl_kernel.inkling_attn_prologue")
 
 
 @cache_once
@@ -86,6 +95,39 @@ def inkling_attn_prologue_verify(
     """Returns fresh contiguous (q_normed, k_normed, v_conv) [T, dq/dkv];
     KV rows are also scattered into k_buf/v_buf at ``loc`` (the attention call
     should pass save_kv_cache=False)."""
+    if _is_xpu_tensor(qkvr):
+        return _xpu_attn_prologue().inkling_attn_prologue_verify(
+            qkvr,
+            k_cache,
+            v_cache,
+            cache_indices,
+            cache_mask,
+            k_weight,
+            v_weight,
+            k_inter,
+            v_inter,
+            q_gamma,
+            k_gamma,
+            eps,
+            loc,
+            k_buf,
+            v_buf,
+            q_off,
+            k_off,
+            v_off,
+            dq,
+            dkv,
+            draft_token_num,
+            activation=activation,
+            use_residual=use_residual,
+            do_store=do_store,
+            mxfp8_quant=mxfp8_quant,
+            sfk=sfk,
+            sfv=sfv,
+            page_size=page_size,
+            log_scaling_tau=log_scaling_tau,
+        )
+
     t = qkvr.shape[0]
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:
@@ -203,6 +245,43 @@ def inkling_attn_prologue_extend(
     to disable). Returns fresh contiguous (q_normed, k_normed, v_conv) and
     scatters KV rows into k_buf/v_buf at ``loc`` when ``do_store`` (the
     attention call should then pass save_kv_cache=False)."""
+    if _is_xpu_tensor(qkvr):
+        return _xpu_attn_prologue().inkling_attn_prologue_extend(
+            qkvr,
+            k_cache,
+            v_cache,
+            cache_indices,
+            cache_mask,
+            has_initial_state,
+            cu,
+            si,
+            k_weight,
+            v_weight,
+            track_rows,
+            track_mask,
+            track_dst,
+            q_gamma,
+            k_gamma,
+            eps,
+            loc,
+            k_buf,
+            v_buf,
+            q_off,
+            k_off,
+            v_off,
+            dq,
+            dkv,
+            activation=activation,
+            use_residual=use_residual,
+            do_store=do_store,
+            mxfp8_quant=mxfp8_quant,
+            sfk=sfk,
+            sfv=sfv,
+            page_size=page_size,
+            do_cache_update=do_cache_update,
+            log_scaling_tau=log_scaling_tau,
+        )
+
     t = qkvr.shape[0]
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:
@@ -317,6 +396,38 @@ def inkling_attn_prologue_decode(
     The k/v conv caches are shift-updated in place (fused_decode_update
     semantics). With ``do_store`` the KV rows are scattered into k_buf/v_buf at
     ``loc``; MXFP8 mode also quantizes Q and writes interleaved K/V scales."""
+    if _is_xpu_tensor(qkvr):
+        return _xpu_attn_prologue().inkling_attn_prologue_decode(
+            qkvr,
+            k_cache,
+            v_cache,
+            cache_indices,
+            cache_mask,
+            k_weight,
+            v_weight,
+            q_gamma,
+            k_gamma,
+            eps,
+            loc,
+            k_buf,
+            v_buf,
+            q_off,
+            k_off,
+            v_off,
+            dq,
+            dkv,
+            activation=activation,
+            use_residual=use_residual,
+            track_mask=track_mask,
+            track_indices=track_indices,
+            do_store=do_store,
+            mxfp8_quant=mxfp8_quant,
+            sfk=sfk,
+            sfv=sfv,
+            page_size=page_size,
+            log_scaling_tau=log_scaling_tau,
+        )
+
     t = qkvr.shape[0]
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:

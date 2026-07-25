@@ -1,3 +1,4 @@
+import importlib
 from enum import IntEnum
 
 import torch
@@ -32,6 +33,18 @@ class SconvType(IntEnum):
     V_LOCAL = 3
     ATTN = 4
     MLP = 5
+
+
+# Module-level cache for sconv metadata (shared across layers in the same forward pass)
+_metadata_cache: dict = {}
+
+
+def _is_xpu_tensor(x: torch.Tensor) -> bool:
+    return getattr(x, "is_xpu", False)
+
+
+def _xpu_sconv():
+    return importlib.import_module("sgl_kernel.inkling_sconv")
 
 
 class ShortConvolution(nn.Module):
@@ -541,6 +554,16 @@ def fused_gather_scatter_to_sconv_cache(
     BLOCK_D = min(triton.next_power_of_2(D), 1024)
     B = mask.shape[0]
 
+    if _is_xpu_tensor(hidden_states):
+        _xpu_sconv().fused_gather_scatter_to_sconv_cache(
+            hidden_states,
+            sconv_cache,
+            track_conv_indices,
+            mask,
+            dst_indices,
+        )
+        return
+
     if (
         is_cuda()
         and hidden_states.dtype == torch.bfloat16
@@ -713,6 +736,20 @@ def fused_draft_extend_sconv_cache(
     B = cache_indices.shape[0]
     D = sconv_cache.shape[2]
     W_minus_1 = sconv_cache.shape[1]
+
+    if _is_xpu_tensor(sconv_cache):
+        _xpu_sconv().fused_draft_extend_sconv_cache(
+            hidden_states,
+            sconv_cache,
+            cache_indices,
+            num_accept_tokens,
+            draft_token_num,
+            do_tracking,
+            crossed,
+            track_step,
+            mamba_track_indices,
+        )
+        return
 
     if (
         is_cuda()

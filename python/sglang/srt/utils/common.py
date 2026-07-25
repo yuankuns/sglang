@@ -94,7 +94,10 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+try:
+    from torchvision.io import decode_jpeg
+except Exception:
+    decode_jpeg = None
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -1881,7 +1884,7 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+    if decode_jpeg is not None and is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             if gpu_image_decode == "nvjpeg_fancy":
                 from sglang.srt.utils.nvjpeg_decoder import (
