@@ -706,6 +706,109 @@ class InklingAttention(nn.Module):
         )
         return q, k, v, do_store, q_descale
 
+    def _xpu_relative_attention_from_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        rel_logits: torch.Tensor,
+        *,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        """Run Inkling relative attention on XPU using SGLang's KV pool metadata."""
+        from sgl_kernel.inkling_relative_attention import inkling_relative_attention
+
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend,
+            get_token_to_kv_pool,
+        )
+
+        attn_backend = get_attn_backend()
+        metadata = attn_backend.forward_metadata
+        pool = get_token_to_kv_pool()
+
+        if save_kv_cache:
+            loc = forward_batch.out_cache_loc
+            swa_loc = getattr(metadata, "swa_out_cache_loc", None)
+            full_loc = getattr(metadata, "out_cache_loc_full_physical", None)
+            pool.set_kv_buffer(
+                self.attn,
+                KVWriteLoc(loc, swa_loc, full_loc=full_loc),
+                k.view(-1, self.num_tp_kv_heads, self.head_dim),
+                v.view(-1, self.num_tp_kv_heads, self.head_dim),
+                self.attn.k_scale,
+                self.attn.v_scale,
+            )
+
+        q_3d = q.contiguous().view(-1, self.num_tp_heads, self.head_dim)
+        key_buffer = pool.get_key_buffer(self.layer_id)
+        value_buffer = pool.get_value_buffer(self.layer_id)
+        page_size = getattr(attn_backend, "page_size", getattr(pool, "page_size", 1))
+        key_cache = key_buffer.view(
+            -1, page_size, self.num_tp_kv_heads, self.head_dim
+        )
+        value_cache = value_buffer.view(
+            -1, page_size, self.num_tp_kv_heads, self.head_dim
+        )
+
+        page_table = metadata.page_table
+        if self.is_local and getattr(metadata, "swa_page_table", None) is not None:
+            page_table = metadata.swa_page_table
+        page_table = page_table.to(torch.int64)
+
+        cu_k = metadata.cu_seqlens_k.to(torch.int32)
+        k_lens = (cu_k[1:] - cu_k[:-1]).to(torch.int64)
+        batch = int(k_lens.numel())
+        max_k = int(k_lens.max().item()) if batch > 0 else 0
+        if max_k == 0:
+            return q.new_empty((q_3d.shape[0], self.num_tp_heads, self.head_dim))
+
+        offsets = torch.arange(max_k, dtype=torch.int64, device=q.device)
+        valid_k = offsets.unsqueeze(0) < k_lens.unsqueeze(1)
+        page_cols = (offsets // page_size).clamp(max=page_table.shape[1] - 1)
+        pages = page_table.gather(1, page_cols.unsqueeze(0).expand(batch, -1))
+        in_page = (offsets % page_size).unsqueeze(0).expand(batch, -1)
+        k_packed = key_cache[pages, in_page][valid_k].contiguous()
+        v_packed = value_cache[pages, in_page][valid_k].contiguous()
+
+        cu_q = metadata.cu_seqlens_q.to(torch.int32)
+        total_q = q_3d.shape[0]
+        if batch == 1:
+            q_to_seq = torch.zeros(total_q, dtype=torch.int32, device=q.device)
+            q_len = cu_q[1] - cu_q[0]
+            prefix_len = cu_k[1] - cu_k[0] - q_len
+            q_pos = (
+                torch.arange(total_q, dtype=torch.int32, device=q.device) + prefix_len
+            )
+        else:
+            q_rows = torch.arange(total_q, dtype=torch.int32, device=q.device)
+            q_to_seq = (
+                torch.searchsorted(cu_q, q_rows, right=True) - 1
+            ).clamp(max=batch - 1)
+            q_lens = cu_q[1:] - cu_q[:-1]
+            q_local = q_rows - cu_q[q_to_seq.to(torch.int64)]
+            prefix_lens = cu_k[1:] - cu_k[:-1] - q_lens
+            q_pos = prefix_lens[q_to_seq.to(torch.int64)] + q_local
+            q_to_seq = q_to_seq.to(torch.int32)
+            q_pos = q_pos.to(torch.int32)
+
+        window_size = (self.local_extent - 1, 0) if self.is_local else (-1, -1)
+        attn_out = inkling_relative_attention(
+            q_3d,
+            k_packed,
+            v_packed,
+            q_to_seq,
+            q_pos,
+            cu_k,
+            rel_bias=rel_logits.float().contiguous(),
+            softmax_scale=self.scaling,
+            causal=True,
+            window_size=window_size,
+        )
+        return attn_out.view(total_q, -1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -727,11 +830,12 @@ class InklingAttention(nn.Module):
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
         server_args = get_server_args()
-        assert server_args.attention_backend in ("fa4", "triton")
+        assert server_args.attention_backend in ("fa4", "triton", "intel_xpu")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
         fa4 = server_args.attention_backend == "fa4"
+        xpu_backend = server_args.attention_backend == "intel_xpu"
 
         rel_event = None
         prologue_did_store = False
@@ -746,9 +850,9 @@ class InklingAttention(nn.Module):
             _fm.is_extend(include_draft_extend_v2=True) and not _prologue_verify
         )
         fused_prologue = (
-            fa4
+            (fa4 or xpu_backend)
             and self.kv_conv
-            and self.alt_stream is not None
+            and (self.alt_stream is not None or xpu_backend)
             and num_tokens > 0
             and self.head_dim == 128
             and (_prologue_verify or _prologue_decode or _prologue_extend)
@@ -761,8 +865,9 @@ class InklingAttention(nn.Module):
             # rel_logits overlaps on the alt stream with the fused prologue
             # {k/v sconv + (save_windows | cache-update) + qk-norm (+ KV store)}
             # on the current stream. Same overlap for verify, decode and extend.
-            current_stream = get_current_device_stream_fast()
-            self.alt_stream.wait_stream(current_stream)
+            if self.alt_stream is not None:
+                current_stream = get_current_device_stream_fast()
+                self.alt_stream.wait_stream(current_stream)
             _tau_arg = log_scaling_tau if fold_tau_q else None
             if _prologue_verify:
                 (
@@ -794,12 +899,17 @@ class InklingAttention(nn.Module):
                 ) = self._fused_attn_prologue_extend(
                     q, k, v, forward_batch, log_scaling_tau=_tau_arg
                 )
-            with torch.cuda.stream(self.alt_stream):
+            if self.alt_stream is not None:
+                with torch.cuda.stream(self.alt_stream):
+                    rel_logits = self.rel_logits_proj(
+                        r, log_scaling_tau if apply_log_scaling else None
+                    )
+                    rel_event = torch.cuda.Event()
+                    rel_event.record()
+            else:
                 rel_logits = self.rel_logits_proj(
                     r, log_scaling_tau if apply_log_scaling else None
                 )
-                rel_event = torch.cuda.Event()
-                rel_event.record()
         use_alt = (
             not fused_prologue
             and fa4
@@ -906,7 +1016,18 @@ class InklingAttention(nn.Module):
             # stay bf16 here and the MXFP8 pool's set_kv_buffer quantizes and
             # stores them in one fused kernel (absent descales signal it).
 
-        if envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4:
+        if xpu_backend:
+            if rel_event is not None:
+                get_current_device_stream_fast().wait_event(rel_event)
+            attn_output = self._xpu_relative_attention_from_kv_cache(
+                q,
+                k,
+                v,
+                forward_batch,
+                rel_logits,
+                save_kv_cache=not prologue_did_store,
+            )
+        elif envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4:
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
             # it into a column-aligned pre-softmax bias.
             attn_output = self.attn(

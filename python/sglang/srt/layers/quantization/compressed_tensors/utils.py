@@ -6,8 +6,20 @@ import re
 from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional
 
-from compressed_tensors import CompressionFormat
 from torch.nn import Module
+
+try:
+    from compressed_tensors import CompressionFormat
+except ModuleNotFoundError:
+
+    class _MissingCompressionFormat:
+        def __getattr__(self, name: str):
+            raise ImportError(
+                "Please install compressed-tensors to use compressed-tensors "
+                "quantization formats."
+            )
+
+    CompressionFormat = _MissingCompressionFormat()
 
 
 def is_activation_quantization_format(format: str) -> bool:

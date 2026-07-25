@@ -16,17 +16,53 @@ from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     inkling_gate_gemv,
     inkling_gate_gemv_fused,
 )
-from sglang.kernels.ops.moe.inkling_moe import (
-    FUSED_PREPROCESS_WIN_TOKENS,
-    compute_grouped_gemm_metadata,
-    fused_moe_preprocess,
-    get_src2dst,
-    grouped_gemm_triton,
-    post_reorder,
-    pre_reorder,
-    select_grouped_gemm_block_m,
-    silu_and_mul_helion,
-)
+try:
+    from sglang.kernels.ops.moe.inkling_moe import (
+        FUSED_PREPROCESS_WIN_TOKENS,
+        compute_grouped_gemm_metadata,
+        fused_moe_preprocess,
+        get_src2dst,
+        grouped_gemm_triton,
+        post_reorder,
+        pre_reorder,
+        select_grouped_gemm_block_m,
+        silu_and_mul_helion,
+    )
+except ModuleNotFoundError as err:
+    if err.name != "helion":
+        raise
+
+    FUSED_PREPROCESS_WIN_TOKENS = 0
+
+    def _missing_helion(*args, **kwargs):
+        raise ImportError("Please install helion to use Inkling routed MoE helpers.")
+
+    compute_grouped_gemm_metadata = _missing_helion
+    fused_moe_preprocess = _missing_helion
+    get_src2dst = _missing_helion
+    grouped_gemm_triton = _missing_helion
+    post_reorder = _missing_helion
+    pre_reorder = _missing_helion
+    select_grouped_gemm_block_m = _missing_helion
+
+    def silu_and_mul_helion(
+        gateup_output: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        use_interleaved: bool = True,
+    ) -> torch.Tensor:
+        gateup = gateup_output.float()
+        if use_interleaved:
+            gate = gateup[:, 0::2]
+            up = gateup[:, 1::2]
+        else:
+            half_hidden_size = gateup.shape[-1] // 2
+            gate = gateup[:, :half_hidden_size]
+            up = gateup[:, half_hidden_size:]
+        out = gate * torch.sigmoid(gate) * up
+        if topk_weights is not None:
+            out = out * topk_weights[:, None].float()
+        return out.to(out_dtype or gateup_output.dtype)
 from sglang.kernels.ops.moe.sigmoid_gate_topk_renorm import (
     sigmoid_gate_topk_renorm,
 )

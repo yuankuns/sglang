@@ -1,3 +1,4 @@
+import importlib
 from typing import TypedDict
 
 import torch
@@ -24,6 +25,15 @@ class SconvExtendMetadata(TypedDict):
 
 
 CHUNK_SIZE = 64
+
+
+def _is_xpu_tensor(x: torch.Tensor) -> bool:
+    return getattr(x, "is_xpu", False)
+
+
+def _xpu_sconv():
+    return importlib.import_module("sgl_kernel.inkling_sconv")
+
 
 # ---------------------------------------------------------------------------
 # Causal conv1d forward with cache-loaded prefix (Triton).
@@ -269,6 +279,9 @@ def fused_decode_sconv_metadata(
     ``(query_start_loc, has_initial_state, SconvDecodeMetadata)`` with tensors
     bit-identical to the unfused path.
     """
+    if _is_xpu_tensor(cache_indices):
+        return _xpu_sconv().fused_decode_sconv_metadata(B, cache_indices)
+
     assert cache_indices.shape[0] == B and cache_indices.stride(0) == 1
     device = cache_indices.device
     query_start_loc = torch.empty(B + 1, dtype=torch.int32, device=device)
@@ -435,6 +448,17 @@ def fused_extend_sconv_metadata(
     (``his_src`` = seq_lens), HIS_ONES (target_verify; ``draft_token_num`` set,
     ``extend_seq_lens`` unused).
     """
+    if _is_xpu_tensor(cache_indices):
+        return _xpu_sconv().fused_extend_sconv_metadata(
+            B=B,
+            T=T,
+            cache_indices=cache_indices,
+            his_mode=his_mode,
+            extend_seq_lens=extend_seq_lens,
+            his_src=his_src,
+            draft_token_num=draft_token_num,
+        )
+
     if B > _FUSED_EXTEND_MAX_B or not cache_indices.is_cuda:
         return None
     assert cache_indices.shape[0] >= B and cache_indices.stride(0) == 1
@@ -532,6 +556,20 @@ def causal_conv1d(
     D = x.shape[1]
     W = weight.shape[1]
     use_silu = activation in ("silu", "swish")
+
+    if _is_xpu_tensor(x):
+        return _xpu_sconv().causal_conv1d(
+            x,
+            weight,
+            sconv_cache,
+            cache_mask,
+            safe_idx,
+            cu,
+            si,
+            activation=activation,
+            use_residual=use_residual,
+            is_decode=is_decode,
+        )
 
     if (
         is_cuda()
@@ -709,6 +747,16 @@ def update_sconv_cache(
     B = cache_indices.shape[0]
     D = x.shape[-1]
     W_minus_1 = sconv_cache.shape[1]
+
+    if _is_xpu_tensor(x):
+        _xpu_sconv().update_sconv_cache(
+            x,
+            sconv_cache,
+            cache_indices,
+            has_initial_state,
+            query_start_loc,
+        )
+        return
 
     if (
         is_cuda()
@@ -965,6 +1013,19 @@ def fused_causal_conv1d_update_decode(
     T, D = x.shape
     W = weight.shape[1]
 
+    if _is_xpu_tensor(x):
+        return _xpu_sconv().fused_causal_conv1d_update_decode(
+            x,
+            weight,
+            sconv_cache,
+            cache_indices,
+            cache_mask,
+            activation=activation,
+            use_residual=use_residual,
+            track_mask=track_mask,
+            track_indices=track_indices,
+        )
+
     if (
         is_cuda()
         and x.dtype == torch.bfloat16
@@ -1116,6 +1177,17 @@ def save_intermediate_conv_windows(
         intermediate_out[:batch_size] = windows
     """
     if batch_size == 0 or draft_token_num == 0:
+        return
+
+    if _is_xpu_tensor(sconv_cache):
+        _xpu_sconv().save_intermediate_conv_windows(
+            sconv_cache,
+            hidden_states,
+            cache_indices,
+            intermediate_out,
+            batch_size,
+            draft_token_num,
+        )
         return
 
     W_minus_1, D = sconv_cache.shape[1], sconv_cache.shape[2]

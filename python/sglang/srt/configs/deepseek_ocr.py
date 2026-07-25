@@ -4,14 +4,18 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image, ImageOps
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as TF
 from transformers import (
     AutoProcessor,
     LlamaTokenizerFast,
     PretrainedConfig,
     ProcessorMixin,
 )
+try:
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
+except Exception:
+    InterpolationMode = None
+    TF = None
 
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
@@ -39,6 +43,15 @@ NGRAM_NO_REPEAT_WINDOW = 90
 NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
 
 DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+
+
+def _require_torchvision_tensor_transforms():
+    if TF is None or InterpolationMode is None:
+        raise ImportError(
+            "Please install torchvision via `pip install torchvision` to use "
+            "DeepSeek-OCR tensor image transforms."
+        )
+    return TF, InterpolationMode
 
 
 def get_default_ngram_custom_params() -> Dict[str, Any]:
@@ -69,10 +82,11 @@ def resize_image(img: DeepseekOCRImage, size: Tuple[int, int]) -> DeepseekOCRIma
     """Resize image to (width, height) for both PIL and tensor."""
     if isinstance(img, Image.Image):
         return img.resize(size, Image.BICUBIC)
-    return TF.resize(
+    tf, interpolation_mode = _require_torchvision_tensor_transforms()
+    return tf.resize(
         img,
         [size[1], size[0]],
-        interpolation=InterpolationMode.BICUBIC,
+        interpolation=interpolation_mode.BICUBIC,
         antialias=True,
     ).contiguous()
 
@@ -98,16 +112,17 @@ def pad_image(
     """
     if isinstance(img, Image.Image):
         return ImageOps.pad(img, target_size, color=fill_color)
+    tf, interpolation_mode = _require_torchvision_tensor_transforms()
     # tensor path: CHW format
     _, h, w = img.shape
     target_w, target_h = target_size
     scale = min(target_w / w, target_h / h)
     new_w = int(w * scale)
     new_h = int(h * scale)
-    resized = TF.resize(
+    resized = tf.resize(
         img,
         [new_h, new_w],
-        interpolation=InterpolationMode.BICUBIC,
+        interpolation=interpolation_mode.BICUBIC,
         antialias=True,
     )
     pad_left = (target_w - new_w) // 2

@@ -2,9 +2,13 @@
 import math
 
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
+try:
+    import torchvision.transforms as T
+    from torchvision.transforms.functional import InterpolationMode
+except Exception:
+    T = None
+    InterpolationMode = None
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -16,6 +20,8 @@ def build_transform(
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
 ):
+    if T is None or InterpolationMode is None:
+        raise ImportError("torchvision is required for InternVL image transforms.")
     transform = T.Compose(
         [
             T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
@@ -193,6 +199,8 @@ def dynamic_resize_image(
     )
     image = image.convert("RGB")
     image = image.resize((target_w, target_h), Image.BICUBIC)
+    if T is None:
+        raise ImportError("torchvision is required for InternVL image transforms.")
     transform = T.Compose(
         [
             T.ToTensor(),
@@ -217,6 +225,8 @@ def resize_image_to_pixels(
     """
     image = image.convert("RGB")
     image = image.resize((target_w, target_h), Image.BICUBIC)
+    if T is None:
+        raise ImportError("torchvision is required for InternVL image transforms.")
     transform = T.Compose(
         [
             T.ToTensor(),
@@ -344,6 +354,8 @@ def video_to_pixel_values(
 
     frame = frame.convert("RGB")
     frame = frame.resize((target_w, target_h), Image.BICUBIC)
+    if T is None:
+        raise ImportError("torchvision is required for InternVL image transforms.")
     transform = T.Compose(
         [
             T.ToTensor(),

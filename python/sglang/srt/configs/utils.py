@@ -7,6 +7,7 @@ from transformers import (
     PretrainedConfig,
     ProcessorMixin,
 )
+from transformers.utils import is_torchvision_available
 
 
 def register_image_processor(
@@ -15,6 +16,8 @@ def register_image_processor(
     """
     register customized hf image processor while removing hf impl
     """
+    if not is_torchvision_available():
+        return
     AutoImageProcessor.register(
         config, slow_image_processor_class=image_processor, exist_ok=True
     )

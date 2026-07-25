@@ -58,9 +58,17 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsMxInt4MoE,
-)
+try:
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsMxInt4MoE,
+    )
+except ModuleNotFoundError as err:
+    if err.name != "compressed_tensors":
+        raise
+
+    class CompressedTensorsMxInt4MoE:
+        pass
+
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod

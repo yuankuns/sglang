@@ -23,11 +23,20 @@ from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarli
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
+try:
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+except ModuleNotFoundError as err:
+    if err.name != "compressed_tensors":
+        raise
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gguf import GGUFConfig
+try:
+    from sglang.srt.layers.quantization.gguf import GGUFConfig
+except ModuleNotFoundError as err:
+    if err.name != "gguf":
+        raise
+    GGUFConfig = DummyConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
