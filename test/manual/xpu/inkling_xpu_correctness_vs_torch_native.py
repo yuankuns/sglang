@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
 from inkling_xpu_offline_engine_smoke import (
     VOCAB_SIZE,
     prepare_sgl_kernel_overlay,
@@ -31,7 +30,13 @@ from inkling_xpu_offline_engine_smoke import (
 )
 
 
-def _engine_kwargs(model_dir: Path, attention_backend: str) -> dict[str, Any]:
+def _engine_kwargs(
+    model_dir: Path,
+    attention_backend: str,
+    *,
+    tp_size: int = 1,
+    watchdog_timeout: int = 300,
+) -> dict[str, Any]:
     return {
         "model_path": str(model_dir),
         "tokenizer_path": str(model_dir),
@@ -40,7 +45,7 @@ def _engine_kwargs(model_dir: Path, attention_backend: str) -> dict[str, Any]:
         "load_format": "safetensors",
         "dtype": "bfloat16",
         "device": "xpu",
-        "tp_size": 1,
+        "tp_size": tp_size,
         "attention_backend": attention_backend,
         "enable_multimodal": False,
         "max_running_requests": 1,
@@ -53,6 +58,7 @@ def _engine_kwargs(model_dir: Path, attention_backend: str) -> dict[str, Any]:
         "skip_server_warmup": True,
         "random_seed": 0,
         "log_level": "info",
+        "watchdog_timeout": watchdog_timeout,
     }
 
 
@@ -99,11 +105,21 @@ def run_engine(
     attention_backend: str,
     input_ids: list[int],
     max_new_tokens: int,
+    *,
+    tp_size: int = 1,
+    watchdog_timeout: int = 300,
 ) -> tuple[list[int], list[torch.Tensor]]:
     import sglang as sgl
 
     print(f"Launching attention_backend={attention_backend}", flush=True)
-    engine = sgl.Engine(**_engine_kwargs(model_dir, attention_backend))
+    engine = sgl.Engine(
+        **_engine_kwargs(
+            model_dir,
+            attention_backend,
+            tp_size=tp_size,
+            watchdog_timeout=watchdog_timeout,
+        )
+    )
     try:
         output = engine.generate(
             input_ids=input_ids,
@@ -204,9 +220,7 @@ def main() -> None:
         atol=args.atol,
     )
     if not all(
-        math.isfinite(metric)
-        for summary in summaries
-        for metric in summary.values()
+        math.isfinite(metric) for summary in summaries for metric in summary.values()
     ):
         raise AssertionError(f"Non-finite comparison summary: {summaries}")
 
