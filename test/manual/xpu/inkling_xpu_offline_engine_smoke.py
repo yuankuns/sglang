@@ -18,12 +18,12 @@ import os
 import shutil
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 from safetensors.torch import save_file
-
 
 HIDDEN_SIZE = 1536
 INTERMEDIATE_SIZE = 768
@@ -39,21 +39,74 @@ SCONV_KERNEL_SIZE = 4
 LOCAL_LAYER_IDS = [1]
 
 
+@dataclass(frozen=True)
+class ReducedInklingSpec:
+    hidden_size: int = HIDDEN_SIZE
+    intermediate_size: int = INTERMEDIATE_SIZE
+    num_layers: int = NUM_LAYERS
+    num_heads: int = NUM_HEADS
+    num_kv_heads: int = NUM_KV_HEADS
+    vocab_size: int = VOCAB_SIZE
+    local_layer_ids: tuple[int, ...] = tuple(LOCAL_LAYER_IDS)
+
+    def validate(self, *, tp_size: int = 1) -> None:
+        if tp_size < 1:
+            raise ValueError(f"tp_size must be positive, got {tp_size}")
+        if self.num_layers < 1:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}")
+        if self.hidden_size != self.num_heads * HEAD_DIM:
+            raise ValueError(
+                "hidden_size must equal num_heads * head_dim, got "
+                f"{self.hidden_size} != {self.num_heads} * {HEAD_DIM}"
+            )
+        for name, value in (
+            ("hidden_size", self.hidden_size),
+            ("intermediate_size", self.intermediate_size),
+            ("num_heads", self.num_heads),
+            ("vocab_size", self.vocab_size),
+        ):
+            if value % tp_size != 0:
+                raise ValueError(
+                    f"{name}={value} must be divisible by tp_size={tp_size}"
+                )
+        if self.num_kv_heads % tp_size != 0 and tp_size % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_kv_heads={self.num_kv_heads} and tp_size={tp_size} "
+                "must divide one another"
+            )
+        if any(
+            layer_id < 0 or layer_id >= self.num_layers
+            for layer_id in self.local_layer_ids
+        ):
+            raise ValueError(
+                f"local_layer_ids={self.local_layer_ids} are invalid for "
+                f"num_layers={self.num_layers}"
+            )
+
+
+DEFAULT_REDUCED_INKLING_SPEC = ReducedInklingSpec()
+
+
 def prepare_sgl_kernel_overlay() -> Path:
     """Put the branch-built sgl_kernel package ahead of site-packages."""
     candidates = []
-    if os.environ.get("SGL_KERNEL_XPU_REPO"):
-        candidates.append(Path(os.environ["SGL_KERNEL_XPU_REPO"]))
+    kernel_repo = os.environ.get("SGLANG_KERNEL_XPU_REPO") or os.environ.get(
+        "SGL_KERNEL_XPU_REPO"
+    )
+    if kernel_repo:
+        candidates.append(Path(kernel_repo))
     candidates.extend(
         [
             Path("/workspace/worktrees/sgl-kernel-xpu/port-inkling-kernel-to-sglang"),
             Path("/data2/syk/worktrees/sgl-kernel-xpu/port-inkling-kernel-to-sglang"),
         ]
     )
-    repo = next((path for path in candidates if (path / "python/sgl_kernel").is_dir()), None)
+    repo = next(
+        (path for path in candidates if (path / "python/sgl_kernel").is_dir()), None
+    )
     if repo is None:
         raise RuntimeError(
-            "Could not find sgl-kernel-xpu checkout. Set SGL_KERNEL_XPU_REPO."
+            "Could not find sgl-kernel-xpu checkout. Set SGLANG_KERNEL_XPU_REPO."
         )
     build_src = repo / "build" / "src"
     if not build_src.is_dir():
@@ -111,35 +164,39 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def write_fake_inkling_checkpoint(model_dir: Path, *, force: bool = False) -> None:
+def write_fake_inkling_checkpoint(
+    model_dir: Path,
+    *,
+    force: bool = False,
+    spec: ReducedInklingSpec = DEFAULT_REDUCED_INKLING_SPEC,
+    tp_size: int = 1,
+) -> None:
+    spec.validate(tp_size=tp_size)
     if force and model_dir.exists():
         shutil.rmtree(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = model_dir / "model.safetensors"
-    if ckpt_path.exists() and not force:
-        return
 
     text_config = {
         "model_type": "inkling_model",
-        "vocab_size": VOCAB_SIZE,
-        "padded_vocab_size": VOCAB_SIZE,
-        "hidden_size": HIDDEN_SIZE,
-        "intermediate_size": INTERMEDIATE_SIZE,
-        "dense_intermediate_size": INTERMEDIATE_SIZE,
-        "num_hidden_layers": NUM_LAYERS,
-        "num_attention_heads": NUM_HEADS,
-        "num_key_value_heads": NUM_KV_HEADS,
+        "vocab_size": spec.vocab_size,
+        "padded_vocab_size": spec.vocab_size,
+        "hidden_size": spec.hidden_size,
+        "intermediate_size": spec.intermediate_size,
+        "dense_intermediate_size": spec.intermediate_size,
+        "num_hidden_layers": spec.num_layers,
+        "num_attention_heads": spec.num_heads,
+        "num_key_value_heads": spec.num_kv_heads,
         "head_dim": HEAD_DIM,
         "v_head_dim": HEAD_DIM,
         "d_rel": D_REL,
         "rel_extent": REL_EXTENT,
-        "local_layer_ids": LOCAL_LAYER_IDS,
+        "local_layer_ids": list(spec.local_layer_ids),
         "sliding_window_size": SLIDING_WINDOW_SIZE,
         "rms_norm_eps": 1e-6,
         "use_embed_norm": False,
         "use_sconv": True,
         "sconv_kernel_size": SCONV_KERNEL_SIZE,
-        "dense_mlp_idx": NUM_LAYERS,
+        "dense_mlp_idx": spec.num_layers,
         "n_routed_experts": 0,
         "n_shared_experts": 0,
         "num_experts_per_tok": 1,
@@ -159,6 +216,23 @@ def write_fake_inkling_checkpoint(model_dir: Path, *, force: bool = False) -> No
         "vision_config": {"model_type": "inkling_vision_model"},
         "tie_word_embeddings": False,
     }
+    ckpt_path = model_dir / "model.safetensors"
+    config_path = model_dir / "config.json"
+    if ckpt_path.exists() and not force:
+        try:
+            existing_config = json.loads(config_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Existing checkpoint has an invalid config: {config_path}. "
+                "Re-run with --force."
+            ) from exc
+        if existing_config == config:
+            return
+        raise RuntimeError(
+            f"Existing checkpoint does not match the requested model size: "
+            f"{model_dir}. Re-run with --force."
+        )
+
     _write_json(model_dir / "config.json", config)
     _write_json(
         model_dir / "generation_config.json",
@@ -173,28 +247,37 @@ def write_fake_inkling_checkpoint(model_dir: Path, *, force: bool = False) -> No
 
     gen = torch.Generator(device="cpu").manual_seed(20260724)
     tensors: dict[str, torch.Tensor] = {
-        "model.llm.embed_tokens.weight": _randn((VOCAB_SIZE, HIDDEN_SIZE), gen),
-        "model.llm.lm_head.weight": _randn((VOCAB_SIZE, HIDDEN_SIZE), gen),
-        "model.llm.norm.weight": _ones((HIDDEN_SIZE,)),
+        "model.llm.embed_tokens.weight": _randn(
+            (spec.vocab_size, spec.hidden_size), gen
+        ),
+        "model.llm.lm_head.weight": _randn((spec.vocab_size, spec.hidden_size), gen),
+        "model.llm.norm.weight": _ones((spec.hidden_size,)),
     }
 
-    kv_width = NUM_KV_HEADS * HEAD_DIM
-    rel_width = NUM_HEADS * D_REL
-    for layer_id in range(NUM_LAYERS):
+    kv_width = spec.num_kv_heads * HEAD_DIM
+    rel_width = spec.num_heads * D_REL
+    local_layer_ids = set(spec.local_layer_ids)
+    for layer_id in range(spec.num_layers):
         prefix = f"model.llm.layers.{layer_id}"
-        tensors[f"{prefix}.attn_norm.weight"] = _ones((HIDDEN_SIZE,))
-        tensors[f"{prefix}.mlp_norm.weight"] = _ones((HIDDEN_SIZE,))
+        tensors[f"{prefix}.attn_norm.weight"] = _ones((spec.hidden_size,))
+        tensors[f"{prefix}.mlp_norm.weight"] = _ones((spec.hidden_size,))
         tensors[f"{prefix}.attn.wq_du.weight"] = _randn(
-            (NUM_HEADS * HEAD_DIM, HIDDEN_SIZE), gen
+            (spec.num_heads * HEAD_DIM, spec.hidden_size), gen
         )
-        tensors[f"{prefix}.attn.wk_dv.weight"] = _randn((kv_width, HIDDEN_SIZE), gen)
-        tensors[f"{prefix}.attn.wv_dv.weight"] = _randn((kv_width, HIDDEN_SIZE), gen)
-        tensors[f"{prefix}.attn.wr_du.weight"] = _randn((rel_width, HIDDEN_SIZE), gen)
+        tensors[f"{prefix}.attn.wk_dv.weight"] = _randn(
+            (kv_width, spec.hidden_size), gen
+        )
+        tensors[f"{prefix}.attn.wv_dv.weight"] = _randn(
+            (kv_width, spec.hidden_size), gen
+        )
+        tensors[f"{prefix}.attn.wr_du.weight"] = _randn(
+            (rel_width, spec.hidden_size), gen
+        )
         tensors[f"{prefix}.attn.wo_ud.weight"] = _randn(
-            (HIDDEN_SIZE, NUM_HEADS * HEAD_DIM), gen
+            (spec.hidden_size, spec.num_heads * HEAD_DIM), gen
         )
         layer_rel_extent = (
-            SLIDING_WINDOW_SIZE if layer_id in LOCAL_LAYER_IDS else REL_EXTENT
+            SLIDING_WINDOW_SIZE if layer_id in local_layer_ids else REL_EXTENT
         )
         tensors[f"{prefix}.attn.rel_logits_proj.proj"] = _randn(
             (D_REL, layer_rel_extent), gen, scale=0.001
@@ -208,16 +291,16 @@ def write_fake_inkling_checkpoint(model_dir: Path, *, force: bool = False) -> No
             (kv_width, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
         )
         tensors[f"{prefix}.attn_sconv.weight"] = _randn(
-            (HIDDEN_SIZE, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
+            (spec.hidden_size, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
         )
         tensors[f"{prefix}.mlp_sconv.weight"] = _randn(
-            (HIDDEN_SIZE, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
+            (spec.hidden_size, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
         )
         tensors[f"{prefix}.mlp.w13_dn.weight"] = _randn(
-            (2 * INTERMEDIATE_SIZE, HIDDEN_SIZE), gen
+            (2 * spec.intermediate_size, spec.hidden_size), gen
         )
         tensors[f"{prefix}.mlp.w2_md.weight"] = _randn(
-            (HIDDEN_SIZE, INTERMEDIATE_SIZE), gen
+            (spec.hidden_size, spec.intermediate_size), gen
         )
 
     save_file(tensors, ckpt_path, metadata={"format": "pt"})
@@ -254,7 +337,16 @@ def _extract_output_ids(output: Any) -> list[int]:
     return []
 
 
-def run_engine(model_dir: Path, prompt_len: int, max_new_tokens: int) -> dict[str, Any]:
+def run_engine(
+    model_dir: Path,
+    prompt_len: int,
+    max_new_tokens: int,
+    *,
+    tp_size: int = 1,
+) -> dict[str, Any]:
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+
     os.environ.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu")
     os.environ.setdefault("ZE_AFFINITY_MASK", "0")
     os.environ.setdefault("SGLANG_OPT_USE_INKLING_CUSTOM_AR", "0")
@@ -272,7 +364,7 @@ def run_engine(model_dir: Path, prompt_len: int, max_new_tokens: int) -> dict[st
         load_format="safetensors",
         dtype="bfloat16",
         device="xpu",
-        tp_size=1,
+        tp_size=tp_size,
         attention_backend="intel_xpu",
         enable_multimodal=False,
         max_running_requests=1,
@@ -310,8 +402,15 @@ def run_engine(model_dir: Path, prompt_len: int, max_new_tokens: int) -> dict[st
     numbers = _collect_numbers(output)
     bad = [x for x in numbers if not math.isfinite(x)]
     if bad:
-        raise AssertionError(f"offline generation returned non-finite values: {bad[:5]}")
-    return {"input_ids": input_ids, "output_ids": output_ids, "raw": output}
+        raise AssertionError(
+            f"offline generation returned non-finite values: {bad[:5]}"
+        )
+    return {
+        "tp_size": tp_size,
+        "input_ids": input_ids,
+        "output_ids": output_ids,
+        "raw": output,
+    }
 
 
 def main() -> None:
