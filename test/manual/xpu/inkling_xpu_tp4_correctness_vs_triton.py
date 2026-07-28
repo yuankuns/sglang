@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare TP4 Inkling XPU and Triton attention outputs on dummy data."""
+"""Compare TP4 Inkling XPU and Triton attention outputs on dummy data.
+
+The fused attention prologue is disabled so both backends receive identically
+preprocessed Q/K/V tensors and this test isolates the attention implementation.
+"""
 
 from __future__ import annotations
 
@@ -26,8 +30,8 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Regenerate checkpoint")
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
-    parser.add_argument("--rtol", type=float, default=1e-2)
-    parser.add_argument("--atol", type=float, default=1e-2)
+    parser.add_argument("--rtol", type=float, default=1e-3)
+    parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--watchdog-timeout", type=int, default=1800)
     parser.add_argument(
         "--xpu-affinity-mask",
@@ -49,7 +53,7 @@ def main() -> None:
     os.environ.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu")
     os.environ["ZE_AFFINITY_MASK"] = args.xpu_affinity_mask
     os.environ.setdefault("SGLANG_OPT_USE_INKLING_CUSTOM_AR", "0")
-    os.environ.setdefault("SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE", "1")
+    os.environ["SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE"] = "0"
 
     import torch
 
