@@ -63,6 +63,8 @@ class FlashAttentionMetadata:
 
     # Sequence lengths for the forward batch
     cache_seqlens_int32: torch.Tensor = None
+    # Prefix lengths before the current extend tokens are appended
+    appendkv_cache_seqlens_int32: torch.Tensor = None
     # Maximum sequence length for query
     max_seq_len_q: int = 1
     # Maximum sequence length for key

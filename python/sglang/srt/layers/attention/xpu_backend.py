@@ -332,6 +332,10 @@ class XPUAttentionBackend(AttentionBackend):
 
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.appendkv_cache_seqlens_int32 = (
+                metadata.cache_seqlens_int32
+                - forward_batch.extend_seq_lens.to(torch.int32)
+            )
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
@@ -632,16 +636,12 @@ class XPUAttentionBackend(AttentionBackend):
             # Uses the same page_table the read path selected above (swa_page_table
             # for hybrid-SWA layers), so write and read never diverge.
             if use_appendkv:
-                cache_seqlens_prefix = (
-                    metadata.cache_seqlens_int32
-                    - forward_batch.extend_seq_lens.to(torch.int32)
-                )
                 appendkv_kwargs = dict(
                     k=k.contiguous(),
                     v=v.contiguous(),
-                    cache_seqlens=cache_seqlens_prefix,
+                    cache_seqlens=metadata.appendkv_cache_seqlens_int32,
                     cu_seqlens_k_new=cu_seqlens_q,
-                    max_seqlen_k=metadata.max_seq_len_q,
+                    max_seqlen_k=max_seqlen_q,
                 )
             else:
                 appendkv_kwargs = dict(
