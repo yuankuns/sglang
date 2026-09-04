@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compare TP4 Inkling XPU and Triton attention outputs on dummy data.
+"""Compare the six-layer TP4 Inkling XPU and Triton outputs on dummy data.
 
 The fused attention prologue is disabled so both backends receive identically
 preprocessed Q/K/V tensors and this test isolates the attention implementation.
+Layers 0..4 use local/SWA attention and layer 5 uses global attention.
 """
 
 from __future__ import annotations
@@ -25,9 +26,14 @@ def main() -> None:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("/workspace/tmp/sglang_fake_inkling_xpu_tp4_smoke"),
+        default=Path("/workspace/tmp/sglang_fake_inkling_xpu_tp4_6layer"),
     )
     parser.add_argument("--force", action="store_true", help="Regenerate checkpoint")
+    parser.add_argument(
+        "--allow-large-checkpoint",
+        action="store_true",
+        help="Allow materializing the approximately 126 GiB fake checkpoint",
+    )
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--rtol", type=float, default=1e-3)
@@ -44,6 +50,12 @@ def main() -> None:
     )
     parser.add_argument("--output-file", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if not args.allow_large_checkpoint:
+        raise RuntimeError(
+            "The official-width reduced model is approximately 126 GiB in BF16; "
+            "pass --allow-large-checkpoint to materialize it."
+        )
 
     if args.max_new_tokens < 2:
         raise ValueError(
@@ -75,20 +87,41 @@ def main() -> None:
     )
     from inkling_xpu_offline_engine_tp4_smoke import (
         TP4_HIDDEN_SIZE,
+        TP4_DENSE_INTERMEDIATE_SIZE,
+        TP4_DENSE_MLP_IDX,
         TP4_INTERMEDIATE_SIZE,
         TP4_LOCAL_LAYER_IDS,
+        TP4_MTP_LOCAL_LAYER_IDS,
         TP4_NUM_HEADS,
         TP4_NUM_KV_HEADS,
         TP4_NUM_LAYERS,
+        TP4_NUM_MTP_LAYERS,
+        TP4_NUM_EXPERTS_PER_TOK,
+        TP4_NUM_ROUTED_EXPERTS,
+        TP4_NUM_SHARED_EXPERTS,
+        TP4_SWA_NUM_KV_HEADS,
+        TP4_VOCAB_SIZE,
     )
 
     spec = ReducedInklingSpec(
         hidden_size=TP4_HIDDEN_SIZE,
         intermediate_size=TP4_INTERMEDIATE_SIZE,
+        dense_intermediate_size=TP4_DENSE_INTERMEDIATE_SIZE,
         num_layers=TP4_NUM_LAYERS,
         num_heads=TP4_NUM_HEADS,
         num_kv_heads=TP4_NUM_KV_HEADS,
+        swa_num_kv_heads=TP4_SWA_NUM_KV_HEADS,
+        vocab_size=TP4_VOCAB_SIZE,
+        unpadded_vocab_size=200058,
         local_layer_ids=TP4_LOCAL_LAYER_IDS,
+        dense_mlp_idx=TP4_DENSE_MLP_IDX,
+        n_routed_experts=TP4_NUM_ROUTED_EXPERTS,
+        n_shared_experts=TP4_NUM_SHARED_EXPERTS,
+        num_experts_per_tok=TP4_NUM_EXPERTS_PER_TOK,
+        use_embed_norm=True,
+        use_global_scale=True,
+        num_mtp_layers=TP4_NUM_MTP_LAYERS,
+        mtp_local_layer_ids=TP4_MTP_LOCAL_LAYER_IDS,
     )
 
     input_ids = list(range(3, 3 + args.prompt_len))

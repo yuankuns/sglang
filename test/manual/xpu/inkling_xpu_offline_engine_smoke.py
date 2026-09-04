@@ -43,17 +43,32 @@ LOCAL_LAYER_IDS = [1]
 class ReducedInklingSpec:
     hidden_size: int = HIDDEN_SIZE
     intermediate_size: int = INTERMEDIATE_SIZE
+    dense_intermediate_size: int = INTERMEDIATE_SIZE
     num_layers: int = NUM_LAYERS
     num_heads: int = NUM_HEADS
     num_kv_heads: int = NUM_KV_HEADS
+    swa_num_kv_heads: int = NUM_KV_HEADS
     vocab_size: int = VOCAB_SIZE
+    unpadded_vocab_size: int | None = None
     local_layer_ids: tuple[int, ...] = tuple(LOCAL_LAYER_IDS)
+    dense_mlp_idx: int = NUM_LAYERS
+    n_routed_experts: int = 0
+    n_shared_experts: int = 0
+    num_experts_per_tok: int = 1
+    use_embed_norm: bool = False
+    use_global_scale: bool = False
+    num_mtp_layers: int = 0
+    mtp_local_layer_ids: tuple[int, ...] = ()
 
     def validate(self, *, tp_size: int = 1) -> None:
         if tp_size < 1:
             raise ValueError(f"tp_size must be positive, got {tp_size}")
         if self.num_layers < 1:
             raise ValueError(f"num_layers must be positive, got {self.num_layers}")
+        if self.num_mtp_layers < 0:
+            raise ValueError(
+                f"num_mtp_layers must be non-negative, got {self.num_mtp_layers}"
+            )
         if self.hidden_size != self.num_heads * HEAD_DIM:
             raise ValueError(
                 "hidden_size must equal num_heads * head_dim, got "
@@ -62,6 +77,7 @@ class ReducedInklingSpec:
         for name, value in (
             ("hidden_size", self.hidden_size),
             ("intermediate_size", self.intermediate_size),
+            ("dense_intermediate_size", self.dense_intermediate_size),
             ("num_heads", self.num_heads),
             ("vocab_size", self.vocab_size),
         ):
@@ -74,6 +90,28 @@ class ReducedInklingSpec:
                 f"num_kv_heads={self.num_kv_heads} and tp_size={tp_size} "
                 "must divide one another"
             )
+        if (
+            self.swa_num_kv_heads % tp_size != 0
+            and tp_size % self.swa_num_kv_heads != 0
+        ):
+            raise ValueError(
+                f"swa_num_kv_heads={self.swa_num_kv_heads} and tp_size={tp_size} "
+                "must divide one another"
+            )
+        if not 0 <= self.dense_mlp_idx <= self.num_layers:
+            raise ValueError(
+                f"dense_mlp_idx={self.dense_mlp_idx} must be in "
+                f"[0, {self.num_layers}]"
+            )
+        if self.dense_mlp_idx < self.num_layers and self.n_routed_experts <= 0:
+            raise ValueError("MoE layers require n_routed_experts > 0")
+        if self.n_routed_experts and not (
+            0 < self.num_experts_per_tok <= self.n_routed_experts
+        ):
+            raise ValueError(
+                f"invalid num_experts_per_tok={self.num_experts_per_tok} for "
+                f"n_routed_experts={self.n_routed_experts}"
+            )
         if any(
             layer_id < 0 or layer_id >= self.num_layers
             for layer_id in self.local_layer_ids
@@ -81,6 +119,14 @@ class ReducedInklingSpec:
             raise ValueError(
                 f"local_layer_ids={self.local_layer_ids} are invalid for "
                 f"num_layers={self.num_layers}"
+            )
+        if any(
+            layer_id < 0 or layer_id >= self.num_mtp_layers
+            for layer_id in self.mtp_local_layer_ids
+        ):
+            raise ValueError(
+                f"mtp_local_layer_ids={self.mtp_local_layer_ids} are invalid for "
+                f"num_mtp_layers={self.num_mtp_layers}"
             )
 
 
@@ -182,10 +228,13 @@ def write_fake_inkling_checkpoint(
         "padded_vocab_size": spec.vocab_size,
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
-        "dense_intermediate_size": spec.intermediate_size,
+        "dense_intermediate_size": spec.dense_intermediate_size,
         "num_hidden_layers": spec.num_layers,
         "num_attention_heads": spec.num_heads,
         "num_key_value_heads": spec.num_kv_heads,
+        "swa_num_attention_heads": spec.num_heads,
+        "swa_num_key_value_heads": spec.swa_num_kv_heads,
+        "swa_head_dim": HEAD_DIM,
         "head_dim": HEAD_DIM,
         "v_head_dim": HEAD_DIM,
         "d_rel": D_REL,
@@ -193,16 +242,24 @@ def write_fake_inkling_checkpoint(
         "local_layer_ids": list(spec.local_layer_ids),
         "sliding_window_size": SLIDING_WINDOW_SIZE,
         "rms_norm_eps": 1e-6,
-        "use_embed_norm": False,
+        "use_embed_norm": spec.use_embed_norm,
         "use_sconv": True,
         "sconv_kernel_size": SCONV_KERNEL_SIZE,
-        "dense_mlp_idx": spec.num_layers,
-        "n_routed_experts": 0,
-        "n_shared_experts": 0,
-        "num_experts_per_tok": 1,
+        "dense_mlp_idx": spec.dense_mlp_idx,
+        "n_routed_experts": spec.n_routed_experts,
+        "n_shared_experts": spec.n_shared_experts,
+        "num_experts_per_tok": spec.num_experts_per_tok,
+        "route_scale": 8.0,
+        "use_gate_bias": spec.n_routed_experts > 0,
+        "gate_activation": "sigmoid",
+        "norm_after_topk": True,
+        "use_global_scale": spec.use_global_scale,
+        "shared_expert_sink": spec.n_shared_experts > 0,
         "inference_moe_w13_interleaved": True,
         "tie_word_embeddings": False,
         "max_position_embeddings": 128,
+        "num_nextn_predict_layers": spec.num_mtp_layers,
+        "unpadded_vocab_size": spec.unpadded_vocab_size,
     }
     config = {
         "architectures": ["InklingForConditionalGeneration"],
@@ -214,9 +271,19 @@ def write_fake_inkling_checkpoint(
         "text_config": text_config,
         "audio_config": {"model_type": "inkling_audio_model"},
         "vision_config": {"model_type": "inkling_vision_model"},
+        "mtp_config": (
+            {
+                "num_nextn_predict_layers": spec.num_mtp_layers,
+                "chain_hidden_post_norm": False,
+                "local_layer_ids": list(spec.mtp_local_layer_ids),
+            }
+            if spec.num_mtp_layers
+            else None
+        ),
         "tie_word_embeddings": False,
     }
     ckpt_path = model_dir / "model.safetensors"
+    mtp_path = model_dir / "mtp.safetensors"
     config_path = model_dir / "config.json"
     if ckpt_path.exists() and not force:
         try:
@@ -226,7 +293,8 @@ def write_fake_inkling_checkpoint(
                 f"Existing checkpoint has an invalid config: {config_path}. "
                 "Re-run with --force."
             ) from exc
-        if existing_config == config:
+        mtp_matches = mtp_path.is_file() == (spec.num_mtp_layers > 0)
+        if existing_config == config and mtp_matches:
             return
         raise RuntimeError(
             f"Existing checkpoint does not match the requested model size: "
@@ -253,12 +321,16 @@ def write_fake_inkling_checkpoint(
         "model.llm.lm_head.weight": _randn((spec.vocab_size, spec.hidden_size), gen),
         "model.llm.norm.weight": _ones((spec.hidden_size,)),
     }
+    if spec.use_embed_norm:
+        tensors["model.llm.embed_norm.weight"] = _ones((spec.hidden_size,))
 
-    kv_width = spec.num_kv_heads * HEAD_DIM
     rel_width = spec.num_heads * D_REL
     local_layer_ids = set(spec.local_layer_ids)
     for layer_id in range(spec.num_layers):
         prefix = f"model.llm.layers.{layer_id}"
+        is_local = layer_id in local_layer_ids
+        layer_kv_heads = spec.swa_num_kv_heads if is_local else spec.num_kv_heads
+        kv_width = layer_kv_heads * HEAD_DIM
         tensors[f"{prefix}.attn_norm.weight"] = _ones((spec.hidden_size,))
         tensors[f"{prefix}.mlp_norm.weight"] = _ones((spec.hidden_size,))
         tensors[f"{prefix}.attn.wq_du.weight"] = _randn(
@@ -276,9 +348,7 @@ def write_fake_inkling_checkpoint(
         tensors[f"{prefix}.attn.wo_ud.weight"] = _randn(
             (spec.hidden_size, spec.num_heads * HEAD_DIM), gen
         )
-        layer_rel_extent = (
-            SLIDING_WINDOW_SIZE if layer_id in local_layer_ids else REL_EXTENT
-        )
+        layer_rel_extent = SLIDING_WINDOW_SIZE if is_local else REL_EXTENT
         tensors[f"{prefix}.attn.rel_logits_proj.proj"] = _randn(
             (D_REL, layer_rel_extent), gen, scale=0.001
         )
@@ -296,14 +366,114 @@ def write_fake_inkling_checkpoint(
         tensors[f"{prefix}.mlp_sconv.weight"] = _randn(
             (spec.hidden_size, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
         )
-        tensors[f"{prefix}.mlp.w13_dn.weight"] = _randn(
-            (2 * spec.intermediate_size, spec.hidden_size), gen
-        )
-        tensors[f"{prefix}.mlp.w2_md.weight"] = _randn(
-            (spec.hidden_size, spec.intermediate_size), gen
-        )
+        if layer_id < spec.dense_mlp_idx:
+            tensors[f"{prefix}.mlp.w13_dn.weight"] = _randn(
+                (2 * spec.dense_intermediate_size, spec.hidden_size), gen
+            )
+            tensors[f"{prefix}.mlp.w2_md.weight"] = _randn(
+                (spec.hidden_size, spec.dense_intermediate_size), gen
+            )
+            if spec.use_global_scale:
+                tensors[f"{prefix}.mlp.global_scale"] = torch.ones(
+                    (1,), dtype=torch.float32
+                )
+        else:
+            experts = spec.n_routed_experts
+            shared = spec.n_shared_experts
+            tensors[f"{prefix}.mlp.experts.w13_weight"] = _randn(
+                (experts, 2 * spec.intermediate_size, spec.hidden_size), gen
+            )
+            tensors[f"{prefix}.mlp.experts.w2_weight"] = _randn(
+                (experts, spec.hidden_size, spec.intermediate_size), gen
+            )
+            tensors[f"{prefix}.mlp.gate.weight"] = _randn(
+                (experts + shared, spec.hidden_size), gen
+            )
+            tensors[f"{prefix}.mlp.gate.bias"] = torch.zeros(
+                (experts,), dtype=torch.float32
+            )
+            tensors[f"{prefix}.mlp.gate.global_scale"] = torch.ones(
+                (1,), dtype=torch.float32
+            )
+            tensors[f"{prefix}.mlp.shared_experts.shared_w13_weight"] = _randn(
+                (shared, 2 * spec.intermediate_size, spec.hidden_size), gen
+            )
+            tensors[f"{prefix}.mlp.shared_experts.shared_w2_weight"] = _randn(
+                (shared, spec.hidden_size, spec.intermediate_size), gen
+            )
 
     save_file(tensors, ckpt_path, metadata={"format": "pt"})
+    if spec.num_mtp_layers:
+        mtp_tensors: dict[str, torch.Tensor] = {}
+        local_mtp_layers = set(spec.mtp_local_layer_ids)
+        q_width = spec.num_heads * HEAD_DIM
+        rel_width = spec.num_heads * D_REL
+        for layer_id in range(spec.num_mtp_layers):
+            prefix = f"model.mtp.layers.{layer_id}"
+            block = f"{prefix}.transformer_block"
+            rel_extent = (
+                SLIDING_WINDOW_SIZE
+                if layer_id in local_mtp_layers
+                else REL_EXTENT
+            )
+            mtp_kv_heads = (
+                spec.swa_num_kv_heads
+                if layer_id in local_mtp_layers
+                else spec.num_kv_heads
+            )
+            mtp_kv_width = mtp_kv_heads * HEAD_DIM
+            mtp_tensors[f"{prefix}.embed_norm.weight"] = _ones((spec.hidden_size,))
+            mtp_tensors[f"{prefix}.hidden_norm.weight"] = _ones((spec.hidden_size,))
+            mtp_tensors[f"{prefix}.input_proj.weight"] = _randn(
+                (spec.hidden_size, 2 * spec.hidden_size), gen
+            )
+            mtp_tensors[f"{block}.attn_norm.weight"] = _ones((spec.hidden_size,))
+            mtp_tensors[f"{block}.mlp_norm.weight"] = _ones((spec.hidden_size,))
+            mtp_tensors[f"{block}.attn.wq_du.weight"] = _randn(
+                (q_width, spec.hidden_size), gen
+            )
+            mtp_tensors[f"{block}.attn.wk_dv.weight"] = _randn(
+                (mtp_kv_width, spec.hidden_size), gen
+            )
+            mtp_tensors[f"{block}.attn.wv_dv.weight"] = _randn(
+                (mtp_kv_width, spec.hidden_size), gen
+            )
+            mtp_tensors[f"{block}.attn.wr_du.weight"] = _randn(
+                (rel_width, spec.hidden_size), gen
+            )
+            mtp_tensors[f"{block}.attn.wo_ud.weight"] = _randn(
+                (spec.hidden_size, q_width), gen
+            )
+            mtp_tensors[f"{block}.attn.rel_logits_proj.proj"] = _randn(
+                (D_REL, rel_extent), gen, scale=0.001
+            )
+            mtp_tensors[f"{block}.attn.q_norm.weight"] = _ones((HEAD_DIM,))
+            mtp_tensors[f"{block}.attn.k_norm.weight"] = _ones((HEAD_DIM,))
+            mtp_tensors[f"{block}.attn.k_sconv.weight"] = _randn(
+                (mtp_kv_width, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
+            )
+            mtp_tensors[f"{block}.attn.v_sconv.weight"] = _randn(
+                (mtp_kv_width, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
+            )
+            mtp_tensors[f"{block}.attn_sconv.weight"] = _randn(
+                (spec.hidden_size, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
+            )
+            mtp_tensors[f"{block}.mlp_sconv.weight"] = _randn(
+                (spec.hidden_size, 1, SCONV_KERNEL_SIZE), gen, scale=0.005
+            )
+            mtp_tensors[f"{block}.mlp.w13_dn.weight"] = _randn(
+                (2 * spec.dense_intermediate_size, spec.hidden_size), gen
+            )
+            mtp_tensors[f"{block}.mlp.w2_md.weight"] = _randn(
+                (spec.hidden_size, spec.dense_intermediate_size), gen
+            )
+            if spec.use_global_scale:
+                mtp_tensors[f"{block}.mlp.global_scale"] = torch.ones(
+                    (1,), dtype=torch.bfloat16
+                )
+        save_file(mtp_tensors, mtp_path, metadata={"format": "pt"})
+    elif mtp_path.exists():
+        mtp_path.unlink()
 
 
 def _collect_numbers(value: Any) -> list[float]:
