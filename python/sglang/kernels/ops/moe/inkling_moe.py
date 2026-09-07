@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils.common import is_sm121
+from sglang.srt.utils.common import get_device_core_count, is_sm121
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
@@ -351,11 +351,11 @@ def silu_and_mul_triton(
     BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
     NUM_STAGES = 2
     max_grid_size = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
-    # Use ~512 SMs worth of blocks, capped to actual work
-    num_sms = torch.cuda.get_device_properties(
-        gateup_output.device
-    ).multi_processor_count
-    grid_size = min(num_sms * 4, max_grid_size)
+    # Use several device cores' worth of blocks, capped to actual work. The
+    # utility dispatches to torch.xpu properties for XPU instead of querying
+    # the CUDA runtime.
+    num_cores = get_device_core_count(gateup_output.device.index or 0)
+    grid_size = min(num_cores * 4, max_grid_size)
 
     _silu_and_mul_triton_kernel[(grid_size,)](
         gateup_out_ptr=gateup_output,
@@ -951,7 +951,11 @@ def grouped_gemm_triton(
     block_size_m: int = BLOCK_SIZE_M,  # must match the schedule's build value
 ) -> torch.Tensor:
     assert a.is_contiguous(), f"{a.shape=} {a.stride()=}"
-    assert b.is_contiguous(), f"{b.shape=} {b.stride()=}"
+    # The loader may expose expert weights as a view into an alignment-padded
+    # allocation. The Triton kernel indexes both outer dimensions explicitly
+    # and only requires the K dimension to be contiguous.
+    assert b.ndim == 3 and b.stride(2) == 1, f"{b.shape=} {b.stride()=}"
+    assert b.stride(0) > 0 and b.stride(1) > 0, f"{b.shape=} {b.stride()=}"
 
     M, K = a.shape
     E, N, K_ = b.shape

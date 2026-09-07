@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the six-layer TP4 Inkling XPU and Triton outputs on dummy data.
+"""Compare the six-layer TP8 Inkling XPU and Triton outputs on dummy data.
 
 The fused attention prologue is disabled so both backends receive identically
 preprocessed Q/K/V tensors and this test isolates the attention implementation.
@@ -17,8 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-TP_SIZE = 4
-DEFAULT_XPU_AFFINITY_MASK = "0,1,2,3"
+TP_SIZE = 8
+DEFAULT_XPU_AFFINITY_MASK = "0,1,2,3,4,5,6,7"
 
 
 def main() -> None:
@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("/workspace/tmp/sglang_fake_inkling_xpu_tp4_6layer"),
+        default=Path("/workspace/tmp/sglang_fake_inkling_xpu_tp8_6layer"),
     )
     parser.add_argument("--force", action="store_true", help="Regenerate checkpoint")
     parser.add_argument(
@@ -85,43 +85,43 @@ def main() -> None:
         prepare_sgl_kernel_overlay,
         write_fake_inkling_checkpoint,
     )
-    from inkling_xpu_offline_engine_tp4_smoke import (
-        TP4_HIDDEN_SIZE,
-        TP4_DENSE_INTERMEDIATE_SIZE,
-        TP4_DENSE_MLP_IDX,
-        TP4_INTERMEDIATE_SIZE,
-        TP4_LOCAL_LAYER_IDS,
-        TP4_MTP_LOCAL_LAYER_IDS,
-        TP4_NUM_HEADS,
-        TP4_NUM_KV_HEADS,
-        TP4_NUM_LAYERS,
-        TP4_NUM_MTP_LAYERS,
-        TP4_NUM_EXPERTS_PER_TOK,
-        TP4_NUM_ROUTED_EXPERTS,
-        TP4_NUM_SHARED_EXPERTS,
-        TP4_SWA_NUM_KV_HEADS,
-        TP4_VOCAB_SIZE,
+    from inkling_xpu_offline_engine_tp8_smoke import (
+        DENSE_INTERMEDIATE_SIZE,
+        DENSE_MLP_IDX,
+        HIDDEN_SIZE,
+        INTERMEDIATE_SIZE,
+        LOCAL_LAYER_IDS,
+        MTP_LOCAL_LAYER_IDS,
+        NUM_EXPERTS_PER_TOK,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        NUM_LAYERS,
+        NUM_MTP_LAYERS,
+        NUM_ROUTED_EXPERTS,
+        NUM_SHARED_EXPERTS,
+        SWA_NUM_KV_HEADS,
+        VOCAB_SIZE,
     )
 
     spec = ReducedInklingSpec(
-        hidden_size=TP4_HIDDEN_SIZE,
-        intermediate_size=TP4_INTERMEDIATE_SIZE,
-        dense_intermediate_size=TP4_DENSE_INTERMEDIATE_SIZE,
-        num_layers=TP4_NUM_LAYERS,
-        num_heads=TP4_NUM_HEADS,
-        num_kv_heads=TP4_NUM_KV_HEADS,
-        swa_num_kv_heads=TP4_SWA_NUM_KV_HEADS,
-        vocab_size=TP4_VOCAB_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dense_intermediate_size=DENSE_INTERMEDIATE_SIZE,
+        num_layers=NUM_LAYERS,
+        num_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        swa_num_kv_heads=SWA_NUM_KV_HEADS,
+        vocab_size=VOCAB_SIZE,
         unpadded_vocab_size=200058,
-        local_layer_ids=TP4_LOCAL_LAYER_IDS,
-        dense_mlp_idx=TP4_DENSE_MLP_IDX,
-        n_routed_experts=TP4_NUM_ROUTED_EXPERTS,
-        n_shared_experts=TP4_NUM_SHARED_EXPERTS,
-        num_experts_per_tok=TP4_NUM_EXPERTS_PER_TOK,
+        local_layer_ids=LOCAL_LAYER_IDS,
+        dense_mlp_idx=DENSE_MLP_IDX,
+        n_routed_experts=NUM_ROUTED_EXPERTS,
+        n_shared_experts=NUM_SHARED_EXPERTS,
+        num_experts_per_tok=NUM_EXPERTS_PER_TOK,
         use_embed_norm=True,
         use_global_scale=True,
-        num_mtp_layers=TP4_NUM_MTP_LAYERS,
-        mtp_local_layer_ids=TP4_MTP_LOCAL_LAYER_IDS,
+        num_mtp_layers=NUM_MTP_LAYERS,
+        mtp_local_layer_ids=MTP_LOCAL_LAYER_IDS,
     )
 
     input_ids = list(range(3, 3 + args.prompt_len))
@@ -154,7 +154,7 @@ def main() -> None:
     print(f"Using sgl_kernel overlay: {overlay}", flush=True)
 
     results = {}
-    with tempfile.TemporaryDirectory(prefix="inkling_tp4_compare_") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="inkling_tp8_compare_") as temp_dir:
         for backend in ("intel_xpu", "triton"):
             output_file = Path(temp_dir) / f"{backend}.pt"
             command = [

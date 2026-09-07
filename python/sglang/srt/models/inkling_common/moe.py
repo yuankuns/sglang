@@ -61,7 +61,7 @@ from sglang.srt.models.inkling_common.util import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 
 _FP32_GEMM_UPCAST = is_hip()
 
@@ -364,6 +364,7 @@ class InklingGate(nn.Module):
             and x.dtype == torch.bfloat16
             and x.is_contiguous()
             and x.shape[-1] == _INKLING_GATE_GEMV_HIDDEN
+            and is_cuda()
             and torch.version.hip is None
         ):
             if gemv_mode >= GateGemvMode.FUSED:
@@ -919,9 +920,13 @@ class InklingMoE(nn.Module):
         # trtllm_routed runner (unquantized ckpts only — a quantized ckpt's excluded
         # bf16 layers resolve to the triton runner, which needs standard topk).
         # moe_tp_forward and MoE-LoRA also need standard topk (LoRA packs internally).
-        self.gate.emit_packed_topk = not lora_compatible_layout_enabled() and (
-            not isinstance(self.experts.quant_method, UnquantizedFusedMoEMethod)
-            or bf16_routed_uses_stock_fused_moe(self.quant_config)
+        self.gate.emit_packed_topk = (
+            not is_xpu()
+            and not lora_compatible_layout_enabled()
+            and (
+                not isinstance(self.experts.quant_method, UnquantizedFusedMoEMethod)
+                or bf16_routed_uses_stock_fused_moe(self.quant_config)
+            )
         )
 
     def _forward_routed(

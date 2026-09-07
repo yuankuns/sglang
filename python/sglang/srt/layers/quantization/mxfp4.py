@@ -360,7 +360,10 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            elif _is_hip:
+            elif _is_hip or _is_xpu:
+                # The XPU MXFP4 implementation is routed-MoE-only. Keep
+                # attention, dense MLP, gate, and shared-expert linears in
+                # their checkpoint dtype.
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
@@ -368,7 +371,7 @@ class Mxfp4Config(QuantizationConfig):
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:
-            if self.is_checkpoint_mxfp4_serialized:
+            if self.is_checkpoint_mxfp4_serialized and not _is_xpu:
                 raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
 
@@ -1091,6 +1094,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(
                 layer.w2_weight.data.view(torch.int8), requires_grad=False
             )
+            # The serialized OCP scale is a biased UE8M0 exponent byte, while
+            # the Xe2 W4A16 kernel consumes its direct floating-point
+            # multiplier. This conversion is exact because every value is a
+            # power of two.
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data.view(torch.float8_e8m0fnu).float(),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data.view(torch.float8_e8m0fnu).float(),
+                requires_grad=False,
+            )
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
@@ -1614,7 +1629,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if _is_xpu:
             # sgl-kernel-xpu path: moe_grouped_mm_nt_xe20_w4a16 consumes the
             # packed MXFP4 weights directly, so no dequantization happens.
-            from sgl_kernel import fused_experts as sgl_fused_experts
+            from sglang.kernels.ops.moe.inkling_mxfp4_xpu_bridge import (
+                get_inkling_mxfp4_fused_experts,
+            )
+
+            sgl_fused_experts = get_inkling_mxfp4_fused_experts()
 
             assert TopKOutputChecker.format_is_standard(topk_output)
             topk_weights, topk_ids, _ = topk_output

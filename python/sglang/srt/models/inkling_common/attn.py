@@ -6,9 +6,6 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-    is_batch_invariant,
-)
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
@@ -40,6 +37,19 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
+
+
+def is_batch_invariant() -> bool:
+    """Load the CUDA-only CUTE helper only when the FA4 path needs it.
+
+    Inkling's XPU relative-attention backend never calls this helper, but an
+    eager import made every XPU startup require the CUDA ``cutlass`` package.
+    """
+    from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+        is_batch_invariant as _is_batch_invariant,
+    )
+
+    return _is_batch_invariant()
 
 try:
     import cutlass.cute as cute
@@ -799,17 +809,36 @@ class InklingAttention(nn.Module):
         cu_k = metadata.cu_seqlens_k.to(torch.int32)
         k_lens = (cu_k[1:] - cu_k[:-1]).to(torch.int64)
         batch = int(k_lens.numel())
-        max_k = int(k_lens.max().item()) if batch > 0 else 0
-        if max_k == 0:
-            return q.new_empty((q_3d.shape[0], self.num_tp_heads, self.head_dim))
+        if batch == 1:
+            # Decode XPU graphs use a fixed-capacity page table. Avoid
+            # k_lens.max().item() and boolean compaction here: both require a
+            # device-to-host wait or a data-dependent output shape, which a
+            # command graph cannot capture. The relative-attention kernel
+            # bounds reads with cu_k, so the unused capacity at the tail of
+            # k_packed/v_packed is never consumed.
+            max_k = page_table.shape[1] * page_size
+            offsets = torch.arange(max_k, dtype=torch.int64, device=q.device)
+            page_cols = offsets // page_size
+            pages = page_table[0, page_cols]
+            in_page = offsets % page_size
+            k_packed = key_cache[pages, in_page].contiguous()
+            v_packed = value_cache[pages, in_page].contiguous()
+        else:
+            max_k = int(k_lens.max().item()) if batch > 0 else 0
+            if max_k == 0:
+                return q.new_empty(
+                    (q_3d.shape[0], self.num_tp_heads, self.head_dim)
+                )
 
-        offsets = torch.arange(max_k, dtype=torch.int64, device=q.device)
-        valid_k = offsets.unsqueeze(0) < k_lens.unsqueeze(1)
-        page_cols = (offsets // page_size).clamp(max=page_table.shape[1] - 1)
-        pages = page_table.gather(1, page_cols.unsqueeze(0).expand(batch, -1))
-        in_page = (offsets % page_size).unsqueeze(0).expand(batch, -1)
-        k_packed = key_cache[pages, in_page][valid_k].contiguous()
-        v_packed = value_cache[pages, in_page][valid_k].contiguous()
+            offsets = torch.arange(max_k, dtype=torch.int64, device=q.device)
+            valid_k = offsets.unsqueeze(0) < k_lens.unsqueeze(1)
+            page_cols = (offsets // page_size).clamp(
+                max=page_table.shape[1] - 1
+            )
+            pages = page_table.gather(1, page_cols.unsqueeze(0).expand(batch, -1))
+            in_page = (offsets % page_size).unsqueeze(0).expand(batch, -1)
+            k_packed = key_cache[pages, in_page][valid_k].contiguous()
+            v_packed = value_cache[pages, in_page][valid_k].contiguous()
 
         cu_q = metadata.cu_seqlens_q.to(torch.int32)
         total_q = q_3d.shape[0]

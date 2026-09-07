@@ -99,9 +99,15 @@ class InklingQuantizationConfigBase:
 
     @staticmethod
     def is_nvfp4(config: dict[str, Any]) -> bool:
-        weight_quant_cfg = config["modelopt_quant_config"]["quant_cfg"][
-            "*weight_quantizer"
-        ]
+        try:
+            weight_quant_cfg = config["modelopt_quant_config"]["quant_cfg"][
+                "*weight_quantizer"
+            ]
+        except (KeyError, TypeError):
+            # Inkling can also use framework-level quantizers such as OCP
+            # MXFP4. Those are resolved by ModelConfig and must pass through
+            # this model-specific ModelOpt probe unchanged.
+            return False
         return tuple(weight_quant_cfg["num_bits"]) == (2, 1) and tuple(
             weight_quant_cfg["block_sizes"].get("scale_bits", [])
         ) == (4, 3)

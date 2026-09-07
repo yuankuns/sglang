@@ -1330,6 +1330,40 @@ class InklingForConditionalGeneration(nn.Module):
         param = params_dict[name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and loaded_weight.ndim == 3
+            and loaded_weight.shape != param.data.shape
+        ):
+            # OCP MXFP4's generic fused loader expects pre-sharded tensors.
+            # Inkling checkpoints retain the normal full-tensor convention:
+            # w13 (and its scale) shard output rows, while w2 (and its scale)
+            # shard the packed intermediate/input dimension.
+            shard_dim = 1 if shard_id == "w13" else 2
+            shard_size = param.data.shape[shard_dim]
+            start = get_parallel().moe_tp_rank * shard_size
+            if start + shard_size > loaded_weight.shape[shard_dim]:
+                raise ValueError(
+                    f"Invalid MXFP4 TP shard for {name}: rank "
+                    f"{get_parallel().moe_tp_rank}, shard=[{start}, "
+                    f"{start + shard_size}), loaded shape={loaded_weight.shape}, "
+                    f"parameter shape={param.data.shape}"
+                )
+
+            # A full-stack narrow is non-contiguous for both projections and
+            # materializes several GiB per layer when made contiguous. Copy one
+            # expert at a time instead: each staging tensor is at most a few
+            # MiB, while the destination remains the standard TP-sharded
+            # FusedMoE parameter. This keeps EP=1 practical on four 24 GiB GPUs.
+            local_dim = shard_dim - 1
+            for expert_id in range(param.data.shape[0]):
+                expert_shard = loaded_weight[expert_id].narrow(
+                    local_dim, start, shard_size
+                )
+                param.data[expert_id].copy_(expert_shard.contiguous())
+            loaded_params.add(name)
+            return True
+        if (
             shard_id == "w13"
             and not self.text_config.inference_moe_w13_interleaved
             and weight_loader is not default_weight_loader
@@ -1625,7 +1659,17 @@ class InklingForConditionalGeneration(nn.Module):
                     params_dict, loaded_params, name, loaded_weight, "w13"
                 ):
                     continue
+            if ".experts.w13_weight_scale" in name:
+                if self._load_fused_moe_param(
+                    params_dict, loaded_params, name, loaded_weight, "w13"
+                ):
+                    continue
             if ".experts.w2_weight" in name:
+                if self._load_fused_moe_param(
+                    params_dict, loaded_params, name, loaded_weight, "w2"
+                ):
+                    continue
+            if ".experts.w2_weight_scale" in name:
                 if self._load_fused_moe_param(
                     params_dict, loaded_params, name, loaded_weight, "w2"
                 ):

@@ -90,6 +90,27 @@ def test_grouped_gemm_small_config_matches(tokens: int):
     torch.testing.assert_close(out16.float(), out128.float(), atol=1e-3, rtol=1e-3)
 
 
+@requires_cuda
+def test_grouped_gemm_accepts_alignment_padded_weights():
+    """The grouped GEMM reads the loader's [E, N, K] padded-stride view directly."""
+    torch.manual_seed(0)
+    tokens, k, n = 16, 768, 1024
+    ids = _ids(tokens, seed=0)
+    a = (torch.randn(tokens * TOPK, k, device="cuda") * 0.05).to(torch.bfloat16)
+    b = (torch.randn(E, n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    padded_storage = torch.empty((E, n, k + 8), dtype=b.dtype, device=b.device)
+    padded_storage[..., :k].copy_(b)
+    padded_b = padded_storage[..., :k]
+    assert not padded_b.is_contiguous()
+    assert padded_b.stride() == (n * (k + 8), k + 8, 1)
+
+    sorted_ids, _ = torch.sort(ids.to(torch.int16), stable=True)
+    metadata = compute_grouped_gemm_metadata(sorted_ids, E)
+    got = grouped_gemm_triton(a, padded_b, E, *metadata)
+    expected = grouped_gemm_triton(a, b, E, *metadata)
+    torch.testing.assert_close(got.float(), expected.float(), atol=1e-3, rtol=1e-3)
+
+
 if __name__ == "__main__":
     import sys
 

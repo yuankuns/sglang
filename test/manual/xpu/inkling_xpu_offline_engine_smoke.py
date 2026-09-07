@@ -59,6 +59,7 @@ class ReducedInklingSpec:
     use_global_scale: bool = False
     num_mtp_layers: int = 0
     mtp_local_layer_ids: tuple[int, ...] = ()
+    routed_experts_mxfp4: bool = False
 
     def validate(self, *, tp_size: int = 1) -> None:
         if tp_size < 1:
@@ -68,11 +69,6 @@ class ReducedInklingSpec:
         if self.num_mtp_layers < 0:
             raise ValueError(
                 f"num_mtp_layers must be non-negative, got {self.num_mtp_layers}"
-            )
-        if self.hidden_size != self.num_heads * HEAD_DIM:
-            raise ValueError(
-                "hidden_size must equal num_heads * head_dim, got "
-                f"{self.hidden_size} != {self.num_heads} * {HEAD_DIM}"
             )
         for name, value in (
             ("hidden_size", self.hidden_size),
@@ -134,7 +130,14 @@ DEFAULT_REDUCED_INKLING_SPEC = ReducedInklingSpec()
 
 
 def prepare_sgl_kernel_overlay() -> Path:
-    """Put the branch-built sgl_kernel package ahead of site-packages."""
+    """Add the branch-built relative-attention extension to sgl_kernel.
+
+    The Inkling XPU branch has the relative-attention extension that the
+    container's newer sgl_kernel wheel lacks.  Its Python package is older,
+    however, so replacing the wheel wholesale drops newer generic operators
+    required by the current SGLang tree.  Build a private overlay from the
+    installed package and add only the missing Inkling module and extension.
+    """
     candidates = []
     kernel_repo = os.environ.get("SGLANG_KERNEL_XPU_REPO") or os.environ.get(
         "SGL_KERNEL_XPU_REPO"
@@ -155,38 +158,39 @@ def prepare_sgl_kernel_overlay() -> Path:
             "Could not find sgl-kernel-xpu checkout. Set SGLANG_KERNEL_XPU_REPO."
         )
     build_src = repo / "build" / "src"
-    if not build_src.is_dir():
+    relative_attention_extension = build_src / "inkling_relative_attention_ops.abi3.so"
+    relative_attention_library = (
+        build_src / "libsgl-ops-sycl-InklingRelativeAttention.so"
+    )
+    if not (
+        relative_attention_extension.is_file()
+        and relative_attention_library.is_file()
+    ):
         raise RuntimeError(f"Missing built sgl-kernel XPU artifacts: {build_src}")
 
-    ld_paths = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
-    if str(build_src) not in ld_paths and not os.environ.get(
-        "SGLANG_KERNEL_XPU_LD_REEXEC"
-    ):
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = (
-            str(build_src)
-            if not env.get("LD_LIBRARY_PATH")
-            else f"{build_src}{os.pathsep}{env['LD_LIBRARY_PATH']}"
-        )
-        env["SGLANG_KERNEL_XPU_LD_REEXEC"] = "1"
-        os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+    import sgl_kernel
 
     overlay = Path(tempfile.mkdtemp(prefix="sgl_kernel_xpu_overlay_"))
     package_dst = overlay / "sgl_kernel"
-    shutil.copytree(repo / "python" / "sgl_kernel", package_dst)
-    for so_path in build_src.glob("*.abi3.so"):
-        shutil.copy2(so_path, package_dst / so_path.name)
+    shutil.copytree(Path(sgl_kernel.__file__).parent, package_dst)
+    shutil.copy2(
+        repo / "python" / "sgl_kernel" / "inkling_relative_attention.py",
+        package_dst / "inkling_relative_attention.py",
+    )
+    shutil.copy2(
+        relative_attention_extension, package_dst / relative_attention_extension.name
+    )
+    shutil.copy2(
+        relative_attention_library, package_dst / relative_attention_library.name
+    )
 
     sys.path.insert(0, str(overlay))
+    sgl_kernel.__path__.insert(0, str(package_dst))
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = (
         str(overlay)
         if not existing_pythonpath
         else f"{overlay}{os.pathsep}{existing_pythonpath}"
-    )
-    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    os.environ["LD_LIBRARY_PATH"] = (
-        str(build_src) if not existing_ld else f"{build_src}{os.pathsep}{existing_ld}"
     )
     return overlay
 
@@ -282,6 +286,8 @@ def write_fake_inkling_checkpoint(
         ),
         "tie_word_embeddings": False,
     }
+    if spec.routed_experts_mxfp4:
+        config["quantization_config"] = {"quant_method": "mxfp4"}
     ckpt_path = model_dir / "model.safetensors"
     mtp_path = model_dir / "mtp.safetensors"
     config_path = model_dir / "config.json"
@@ -380,12 +386,46 @@ def write_fake_inkling_checkpoint(
         else:
             experts = spec.n_routed_experts
             shared = spec.n_shared_experts
-            tensors[f"{prefix}.mlp.experts.w13_weight"] = _randn(
-                (experts, 2 * spec.intermediate_size, spec.hidden_size), gen
-            )
-            tensors[f"{prefix}.mlp.experts.w2_weight"] = _randn(
-                (experts, spec.hidden_size, spec.intermediate_size), gen
-            )
+            if spec.routed_experts_mxfp4:
+                tensors[f"{prefix}.mlp.experts.w13_weight"] = torch.randint(
+                    0,
+                    256,
+                    (experts, 2 * spec.intermediate_size, spec.hidden_size // 2),
+                    generator=gen,
+                    dtype=torch.uint8,
+                )
+                tensors[f"{prefix}.mlp.experts.w13_weight_scale"] = torch.full(
+                    (
+                        experts,
+                        2 * spec.intermediate_size,
+                        spec.hidden_size // 32,
+                    ),
+                    120,
+                    dtype=torch.uint8,
+                )
+                tensors[f"{prefix}.mlp.experts.w2_weight"] = torch.randint(
+                    0,
+                    256,
+                    (experts, spec.hidden_size, spec.intermediate_size // 2),
+                    generator=gen,
+                    dtype=torch.uint8,
+                )
+                tensors[f"{prefix}.mlp.experts.w2_weight_scale"] = torch.full(
+                    (
+                        experts,
+                        spec.hidden_size,
+                        spec.intermediate_size // 32,
+                    ),
+                    120,
+                    dtype=torch.uint8,
+                )
+            else:
+                tensors[f"{prefix}.mlp.experts.w13_weight"] = _randn(
+                    (experts, 2 * spec.intermediate_size, spec.hidden_size), gen
+                )
+                tensors[f"{prefix}.mlp.experts.w2_weight"] = _randn(
+                    (experts, spec.hidden_size, spec.intermediate_size), gen
+                )
             tensors[f"{prefix}.mlp.gate.weight"] = _randn(
                 (experts + shared, spec.hidden_size), gen
             )
@@ -513,9 +553,19 @@ def run_engine(
     max_new_tokens: int,
     *,
     tp_size: int = 1,
+    ep_size: int = 1,
+    mem_fraction_static: float = 0.25,
 ) -> dict[str, Any]:
     if tp_size < 1:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if ep_size < 1 or tp_size % ep_size != 0:
+        raise ValueError(
+            f"ep_size={ep_size} must be a positive divisor of tp_size={tp_size}"
+        )
+    if not 0.0 < mem_fraction_static <= 1.0:
+        raise ValueError(
+            f"mem_fraction_static must be in (0, 1], got {mem_fraction_static}"
+        )
 
     os.environ.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu")
     os.environ.setdefault("ZE_AFFINITY_MASK", "0")
@@ -535,13 +585,14 @@ def run_engine(
         dtype="bfloat16",
         device="xpu",
         tp_size=tp_size,
+        ep_size=ep_size,
         attention_backend="intel_xpu",
         enable_multimodal=False,
         max_running_requests=1,
         max_total_tokens=1024,
         context_length=128,
         swa_full_tokens_ratio=1.0,
-        mem_fraction_static=0.25,
+        mem_fraction_static=mem_fraction_static,
         disable_prefill_cuda_graph=True,
         disable_decode_cuda_graph=True,
         skip_server_warmup=True,
