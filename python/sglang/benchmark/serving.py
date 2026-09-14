@@ -741,9 +741,10 @@ async def async_request_sglang_generate(
                                     "cached_tokens_details"
                                 )
 
-                            if "text" in data and data["text"]:
+                            if data.get("text") or data.get("output_ids"):
                                 timestamp = time.perf_counter()
-                                generated_text = data["text"]
+                                if data.get("text"):
+                                    generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
 
                                 # First token
