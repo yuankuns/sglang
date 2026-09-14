@@ -80,6 +80,8 @@ def main() -> None:
     )
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
+    parser.add_argument("--max-total-tokens", type=int, default=1024)
+    parser.add_argument("--context-length", type=int, default=128)
     parser.add_argument(
         "--warmup-requests",
         type=int,
@@ -184,6 +186,8 @@ def main() -> None:
         enable_prefill_xpu_graph=args.enable_prefill_xpu_graph,
         warmup_requests=args.warmup_requests,
         decode_graph_batch_sizes=args.decode_graph_batch_sizes,
+        max_total_tokens=args.max_total_tokens,
+        context_length=args.context_length,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

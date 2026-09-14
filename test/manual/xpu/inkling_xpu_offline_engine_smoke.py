@@ -538,11 +538,20 @@ def run_engine(
     warmup_requests: int = 0,
     measure_ttft: bool = False,
     decode_graph_batch_sizes: list[int] | None = None,
+    max_total_tokens: int = 1024,
+    context_length: int = 128,
 ) -> dict[str, Any]:
     if tp_size < 1:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
     if warmup_requests < 0:
         raise ValueError(f"warmup_requests must be non-negative, got {warmup_requests}")
+    if max_total_tokens < 1:
+        raise ValueError(f"max_total_tokens must be positive, got {max_total_tokens}")
+    if context_length < prompt_len + max_new_tokens:
+        raise ValueError(
+            "context_length must cover prompt_len + max_new_tokens: "
+            f"{context_length} < {prompt_len + max_new_tokens}"
+        )
     if decode_graph_batch_sizes is not None and (
         not decode_graph_batch_sizes
         or any(batch_size < 1 for batch_size in decode_graph_batch_sizes)
@@ -588,8 +597,8 @@ def run_engine(
         attention_backend="intel_xpu",
         enable_multimodal=False,
         max_running_requests=max_decode_batch_size,
-        max_total_tokens=1024,
-        context_length=128,
+        max_total_tokens=max_total_tokens,
+        context_length=context_length,
         swa_full_tokens_ratio=1.0,
         mem_fraction_static=mem_fraction_static,
         disable_prefill_cuda_graph=not enable_prefill_xpu_graph,
