@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 import ctypes
 import importlib.util
+import os
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -20,9 +20,7 @@ def _kernel_repo() -> Path:
         Path("/data2/syk/worktrees/sgl-kernel-xpu/inkling-xpu-e2e"),
     ]
     for candidate in candidates:
-        if candidate is not None and (
-            candidate / "include/sgl_kernel_ops.h"
-        ).is_file():
+        if candidate is not None and (candidate / "include/sgl_kernel_ops.h").is_file():
             return candidate
     raise RuntimeError(
         "The Inkling MXFP4 XPU bridge needs a built sgl-kernel-xpu checkout; "
@@ -37,7 +35,10 @@ def ensure_inkling_mxfp4_xpu_op() -> None:
     from torch.utils.cpp_extension import load
 
     repo = _kernel_repo()
-    build_dir = repo / "build/src"
+    build_root = Path(
+        os.environ.get("SGLANG_KERNEL_XPU_BUILD_DIR", str(repo / "build"))
+    )
+    build_dir = build_root / "src"
     library = build_dir / "libsgl-ops-sycl-GroupGemmMxfp4W4A16Xe20.so"
     if not library.is_file():
         raise RuntimeError(f"Missing built MXFP4 XPU kernel: {library}")
@@ -47,9 +48,7 @@ def ensure_inkling_mxfp4_xpu_op() -> None:
     # only the MXFP4 family, so publish those symbols before loading the
     # dispatcher library.
     for tile_library in sorted(
-        build_dir.glob(
-            "libsgl-ops-sycl-GroupGemmMxfp4W4A16Xe20_inst_*.so"
-        )
+        build_dir.glob("libsgl-ops-sycl-GroupGemmMxfp4W4A16Xe20_inst_*.so")
     ):
         ctypes.CDLL(str(tile_library), mode=ctypes.RTLD_GLOBAL)
 

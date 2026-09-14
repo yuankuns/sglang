@@ -119,6 +119,12 @@ def resolve_prefill_backend(
             debug_eager=get_exec().graph.debug_cuda_graph,
         )
     if backend_name == Backend.FULL:
+        if model_runner.device == "xpu":
+            from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+                FullXPUGraphBackend,
+            )
+
+            return FullXPUGraphBackend(cuda_graph_runner)
         return FullCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,

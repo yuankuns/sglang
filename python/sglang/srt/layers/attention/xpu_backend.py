@@ -444,6 +444,7 @@ class XPUAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        rel_bias: Optional[torch.Tensor] = None,
     ):
         if k is None and v is None:
             # Cross-layer KV sharing (Gemma 4): the layer reuses another
@@ -529,6 +530,8 @@ class XPUAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+        if rel_bias is not None:
+            kwargs["rel_bias"] = rel_bias.contiguous()
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -777,6 +780,7 @@ class XPUAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        rel_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is None and v is None:
             # Cross-layer KV sharing (Gemma 4): see forward_extend for details.
@@ -841,6 +845,8 @@ class XPUAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+        if rel_bias is not None:
+            kwargs["rel_bias"] = rel_bias.contiguous()
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -1075,11 +1081,19 @@ class XPUAttentionBackend(AttentionBackend):
           - replay:  in_capture=False → update pre-allocated buffers in-place
           - eager:   via init_forward_metadata() default wrapper
         """
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_extend() and not (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+            or forward_mode.is_dllm_extend()
+        ):
+            self._init_full_cg_prefill_metadata(forward_batch, in_capture)
+            return
+
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
         assert spec_info is None, (
@@ -1217,6 +1231,113 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 metadata.swa_page_table = swa_page_table[:bs, :]
 
+        self.forward_metadata = metadata
+
+    def _init_full_cg_prefill_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool,
+    ):
+        """Build pointer-stable metadata for a full prefill XPU graph.
+
+        Full prefill capture pads tokens and request slots to fixed buckets.
+        Device tensors below keep the addresses recorded by the XPU graph,
+        while replay refreshes their contents from the live request.
+        """
+        bs = forward_batch.batch_size
+        if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
+            device = forward_batch.seq_lens.device
+            max_num_pages = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
+            metadata = FlashAttentionMetadata()
+            metadata.cache_seqlens_int32 = torch.zeros(
+                bs, dtype=torch.int32, device=device
+            )
+            metadata.cu_seqlens_q = torch.zeros(
+                bs + 1, dtype=torch.int32, device=device
+            )
+            metadata.cu_seqlens_k = torch.zeros(
+                bs + 1, dtype=torch.int32, device=device
+            )
+            metadata.page_table = torch.zeros(
+                bs, max_num_pages, dtype=torch.int32, device=device
+            )
+            self.full_cg_prefill_strided_indices = torch.arange(
+                0, self.max_context_len, self.page_size, device=device
+            )
+            if self.use_sliding_window_kv_pool:
+                assert forward_batch.out_cache_loc is not None
+                metadata.swa_page_table = torch.zeros(
+                    bs, max_num_pages, dtype=torch.int32, device=device
+                )
+                self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
+                    forward_batch.out_cache_loc.shape[0],
+                    dtype=torch.int64,
+                    device=device,
+                )
+            self.full_cg_prefill_metadata = metadata
+
+        metadata = self.full_cg_prefill_metadata
+        assert metadata is not None and bs == metadata.cache_seqlens_int32.shape[0], (
+            "full prefill XPU graph metadata must use the fixed request-slot "
+            "count selected during capture"
+        )
+
+        seq_lens = forward_batch.seq_lens[:bs]
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+        )
+        metadata.cu_seqlens_q[1:].copy_(
+            torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0, dtype=torch.int32)
+        )
+
+        max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
+        max_seq_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
+        if max_seq_pages:
+            page_starts = self.req_to_token[
+                forward_batch.req_pool_indices[:bs, None],
+                self.full_cg_prefill_strided_indices[:max_seq_pages],
+            ]
+            metadata.page_table[:, :max_seq_pages].copy_(
+                (page_starts // self.page_size).to(torch.int32)
+            )
+            metadata.page_table[:, max_seq_pages:].zero_()
+            if self.use_sliding_window_kv_pool:
+                swa_page_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_starts
+                )
+                metadata.swa_page_table[:, :max_seq_pages].copy_(
+                    (swa_page_starts // self.page_size).to(torch.int32)
+                )
+                metadata.swa_page_table[:, max_seq_pages:].zero_()
+        else:
+            metadata.page_table.zero_()
+            if self.use_sliding_window_kv_pool:
+                metadata.swa_page_table.zero_()
+
+        if self.use_sliding_window_kv_pool:
+            out_cache_loc = forward_batch.out_cache_loc
+            assert out_cache_loc is not None
+            num_out = out_cache_loc.shape[0]
+            if num_out > self.full_cg_prefill_swa_out_cache_loc.shape[0]:
+                raise ValueError(
+                    "full prefill XPU graph SWA write-location buffer is too "
+                    f"small: {num_out} > "
+                    f"{self.full_cg_prefill_swa_out_cache_loc.shape[0]}"
+                )
+            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+            )
+            self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
+            metadata.swa_out_cache_loc = self.full_cg_prefill_swa_out_cache_loc[
+                :num_out
+            ]
+
+        if in_capture:
+            metadata.max_seq_len_q = forward_batch.positions.numel()
+            metadata.max_seq_len_k = self.max_context_len
         self.forward_metadata = metadata
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):

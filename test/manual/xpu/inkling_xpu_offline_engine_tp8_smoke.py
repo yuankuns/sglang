@@ -81,6 +81,29 @@ def main() -> None:
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help="Run this many unmeasured requests before the reported request",
+    )
+    parser.add_argument(
+        "--enable-decode-xpu-graph",
+        action="store_true",
+        help="Capture and replay the TP8 decode step with the full XPU graph backend",
+    )
+    parser.add_argument(
+        "--enable-prefill-xpu-graph",
+        action="store_true",
+        help="Capture and replay the TP8 prefill step with the full XPU graph backend",
+    )
+    parser.add_argument(
+        "--decode-graph-batch-sizes",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="Decode batch-size buckets to capture when decode XPU graph is enabled",
+    )
+    parser.add_argument(
         "--xpu-affinity-mask",
         default=os.environ.get("ZE_AFFINITY_MASK", DEFAULT_XPU_AFFINITY_MASK),
         help="ZE_AFFINITY_MASK value exposing at least eight XPU devices",
@@ -157,6 +180,10 @@ def main() -> None:
         args.max_new_tokens,
         tp_size=TP_SIZE,
         mem_fraction_static=0.90,
+        enable_decode_xpu_graph=args.enable_decode_xpu_graph,
+        enable_prefill_xpu_graph=args.enable_prefill_xpu_graph,
+        warmup_requests=args.warmup_requests,
+        decode_graph_batch_sizes=args.decode_graph_batch_sizes,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

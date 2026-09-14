@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     )
 
 
-class FullXPUGraphBackend(BaseCudaGraphBackend):
+class FullXPUGraphBackend(FullCudaGraphBackend):
     """One torch.xpu.XPUGraph per shape for Intel XPU devices."""
 
     def __init__(

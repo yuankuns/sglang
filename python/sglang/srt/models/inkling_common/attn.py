@@ -51,6 +51,7 @@ def is_batch_invariant() -> bool:
 
     return _is_batch_invariant()
 
+
 try:
     import cutlass.cute as cute
     from cutlass.cute import Float32
@@ -754,128 +755,6 @@ class InklingAttention(nn.Module):
         )
         return q, k, v, do_store, q_descale
 
-    def _xpu_relative_attention_from_kv_cache(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        forward_batch: ForwardBatch,
-        rel_logits: torch.Tensor,
-        *,
-        save_kv_cache: bool,
-    ) -> torch.Tensor:
-        """Run Inkling relative attention on XPU using SGLang's KV pool metadata."""
-        from sgl_kernel.inkling_relative_attention import inkling_relative_attention
-
-        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-        from sglang.srt.model_executor.forward_context import (
-            get_attn_backend,
-            get_token_to_kv_pool,
-        )
-
-        attn_backend = get_attn_backend()
-        metadata = attn_backend.forward_metadata
-        pool = get_token_to_kv_pool()
-
-        if save_kv_cache:
-            loc = forward_batch.out_cache_loc
-            swa_loc = getattr(metadata, "swa_out_cache_loc", None)
-            full_loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            pool.set_kv_buffer(
-                self.attn,
-                KVWriteLoc(loc, swa_loc, full_loc=full_loc),
-                k.view(-1, self.num_tp_kv_heads, self.head_dim),
-                v.view(-1, self.num_tp_kv_heads, self.head_dim),
-                self.attn.k_scale,
-                self.attn.v_scale,
-            )
-
-        q_3d = q.contiguous().view(-1, self.num_tp_heads, self.head_dim)
-        key_buffer = pool.get_key_buffer(self.layer_id)
-        value_buffer = pool.get_value_buffer(self.layer_id)
-        page_size = getattr(attn_backend, "page_size", getattr(pool, "page_size", 1))
-        key_cache = key_buffer.view(
-            -1, page_size, self.num_tp_kv_heads, self.head_dim
-        )
-        value_cache = value_buffer.view(
-            -1, page_size, self.num_tp_kv_heads, self.head_dim
-        )
-
-        page_table = metadata.page_table
-        if self.is_local and getattr(metadata, "swa_page_table", None) is not None:
-            page_table = metadata.swa_page_table
-        page_table = page_table.to(torch.int64)
-
-        cu_k = metadata.cu_seqlens_k.to(torch.int32)
-        k_lens = (cu_k[1:] - cu_k[:-1]).to(torch.int64)
-        batch = int(k_lens.numel())
-        if batch == 1:
-            # Decode XPU graphs use a fixed-capacity page table. Avoid
-            # k_lens.max().item() and boolean compaction here: both require a
-            # device-to-host wait or a data-dependent output shape, which a
-            # command graph cannot capture. The relative-attention kernel
-            # bounds reads with cu_k, so the unused capacity at the tail of
-            # k_packed/v_packed is never consumed.
-            max_k = page_table.shape[1] * page_size
-            offsets = torch.arange(max_k, dtype=torch.int64, device=q.device)
-            page_cols = offsets // page_size
-            pages = page_table[0, page_cols]
-            in_page = offsets % page_size
-            k_packed = key_cache[pages, in_page].contiguous()
-            v_packed = value_cache[pages, in_page].contiguous()
-        else:
-            max_k = int(k_lens.max().item()) if batch > 0 else 0
-            if max_k == 0:
-                return q.new_empty(
-                    (q_3d.shape[0], self.num_tp_heads, self.head_dim)
-                )
-
-            offsets = torch.arange(max_k, dtype=torch.int64, device=q.device)
-            valid_k = offsets.unsqueeze(0) < k_lens.unsqueeze(1)
-            page_cols = (offsets // page_size).clamp(
-                max=page_table.shape[1] - 1
-            )
-            pages = page_table.gather(1, page_cols.unsqueeze(0).expand(batch, -1))
-            in_page = (offsets % page_size).unsqueeze(0).expand(batch, -1)
-            k_packed = key_cache[pages, in_page][valid_k].contiguous()
-            v_packed = value_cache[pages, in_page][valid_k].contiguous()
-
-        cu_q = metadata.cu_seqlens_q.to(torch.int32)
-        total_q = q_3d.shape[0]
-        if batch == 1:
-            q_to_seq = torch.zeros(total_q, dtype=torch.int32, device=q.device)
-            q_len = cu_q[1] - cu_q[0]
-            prefix_len = cu_k[1] - cu_k[0] - q_len
-            q_pos = (
-                torch.arange(total_q, dtype=torch.int32, device=q.device) + prefix_len
-            )
-        else:
-            q_rows = torch.arange(total_q, dtype=torch.int32, device=q.device)
-            q_to_seq = (
-                torch.searchsorted(cu_q, q_rows, right=True) - 1
-            ).clamp(max=batch - 1)
-            q_lens = cu_q[1:] - cu_q[:-1]
-            q_local = q_rows - cu_q[q_to_seq.to(torch.int64)]
-            prefix_lens = cu_k[1:] - cu_k[:-1] - q_lens
-            q_pos = prefix_lens[q_to_seq.to(torch.int64)] + q_local
-            q_to_seq = q_to_seq.to(torch.int32)
-            q_pos = q_pos.to(torch.int32)
-
-        window_size = (self.local_extent - 1, 0) if self.is_local else (-1, -1)
-        attn_out = inkling_relative_attention(
-            q_3d,
-            k_packed,
-            v_packed,
-            q_to_seq,
-            q_pos,
-            cu_k,
-            rel_bias=rel_logits.float().contiguous(),
-            softmax_scale=self.scaling,
-            causal=True,
-            window_size=window_size,
-        )
-        return attn_out.view(total_q, -1)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1089,13 +968,14 @@ class InklingAttention(nn.Module):
         if xpu_backend:
             if rel_event is not None:
                 get_current_device_stream_fast().wait_event(rel_event)
-            attn_output = self._xpu_relative_attention_from_kv_cache(
+            attn_output = self.attn(
                 q,
                 k,
                 v,
                 forward_batch,
-                rel_logits,
                 save_kv_cache=not prologue_did_store,
+                rel_bias=rel_logits,
+                **extra_attn_kwargs,
             )
         elif torch_native:
             attn_output = self.attn(

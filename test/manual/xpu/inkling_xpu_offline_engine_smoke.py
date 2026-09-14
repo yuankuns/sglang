@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -96,8 +97,7 @@ class ReducedInklingSpec:
             )
         if not 0 <= self.dense_mlp_idx <= self.num_layers:
             raise ValueError(
-                f"dense_mlp_idx={self.dense_mlp_idx} must be in "
-                f"[0, {self.num_layers}]"
+                f"dense_mlp_idx={self.dense_mlp_idx} must be in [0, {self.num_layers}]"
             )
         if self.dense_mlp_idx < self.num_layers and self.n_routed_experts <= 0:
             raise ValueError("MoE layers require n_routed_experts > 0")
@@ -130,14 +130,7 @@ DEFAULT_REDUCED_INKLING_SPEC = ReducedInklingSpec()
 
 
 def prepare_sgl_kernel_overlay() -> Path:
-    """Add the branch-built relative-attention extension to sgl_kernel.
-
-    The Inkling XPU branch has the relative-attention extension that the
-    container's newer sgl_kernel wheel lacks.  Its Python package is older,
-    however, so replacing the wheel wholesale drops newer generic operators
-    required by the current SGLang tree.  Build a private overlay from the
-    installed package and add only the missing Inkling module and extension.
-    """
+    """Use the sgl-kernel-xpu main package and its matching build artifacts."""
     candidates = []
     kernel_repo = os.environ.get("SGLANG_KERNEL_XPU_REPO") or os.environ.get(
         "SGL_KERNEL_XPU_REPO"
@@ -146,8 +139,8 @@ def prepare_sgl_kernel_overlay() -> Path:
         candidates.append(Path(kernel_repo))
     candidates.extend(
         [
-            Path("/workspace/worktrees/sgl-kernel-xpu/port-inkling-kernel-to-sglang"),
-            Path("/data2/syk/worktrees/sgl-kernel-xpu/port-inkling-kernel-to-sglang"),
+            Path("/workspace/sgl-kernel-xpu"),
+            Path("/data2/syk/sgl-kernel-xpu"),
         ]
     )
     repo = next(
@@ -157,35 +150,22 @@ def prepare_sgl_kernel_overlay() -> Path:
         raise RuntimeError(
             "Could not find sgl-kernel-xpu checkout. Set SGLANG_KERNEL_XPU_REPO."
         )
-    build_src = repo / "build" / "src"
-    relative_attention_extension = build_src / "inkling_relative_attention_ops.abi3.so"
-    relative_attention_library = (
-        build_src / "libsgl-ops-sycl-InklingRelativeAttention.so"
+    build_root = Path(
+        os.environ.get("SGLANG_KERNEL_XPU_BUILD_DIR", str(repo / "build"))
     )
-    if not (
-        relative_attention_extension.is_file()
-        and relative_attention_library.is_file()
-    ):
+    build_src = build_root / "src"
+    common_ops = build_src / "common_ops.abi3.so"
+    shared_libraries = sorted(build_src.glob("*.so"))
+    if not common_ops.is_file() or not shared_libraries:
         raise RuntimeError(f"Missing built sgl-kernel XPU artifacts: {build_src}")
-
-    import sgl_kernel
 
     overlay = Path(tempfile.mkdtemp(prefix="sgl_kernel_xpu_overlay_"))
     package_dst = overlay / "sgl_kernel"
-    shutil.copytree(Path(sgl_kernel.__file__).parent, package_dst)
-    shutil.copy2(
-        repo / "python" / "sgl_kernel" / "inkling_relative_attention.py",
-        package_dst / "inkling_relative_attention.py",
-    )
-    shutil.copy2(
-        relative_attention_extension, package_dst / relative_attention_extension.name
-    )
-    shutil.copy2(
-        relative_attention_library, package_dst / relative_attention_library.name
-    )
+    shutil.copytree(repo / "python" / "sgl_kernel", package_dst)
+    for library in shared_libraries:
+        shutil.copy2(library, package_dst / library.name)
 
     sys.path.insert(0, str(overlay))
-    sgl_kernel.__path__.insert(0, str(package_dst))
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = (
         str(overlay)
@@ -452,9 +432,7 @@ def write_fake_inkling_checkpoint(
             prefix = f"model.mtp.layers.{layer_id}"
             block = f"{prefix}.transformer_block"
             rel_extent = (
-                SLIDING_WINDOW_SIZE
-                if layer_id in local_mtp_layers
-                else REL_EXTENT
+                SLIDING_WINDOW_SIZE if layer_id in local_mtp_layers else REL_EXTENT
             )
             mtp_kv_heads = (
                 spec.swa_num_kv_heads
@@ -555,9 +533,23 @@ def run_engine(
     tp_size: int = 1,
     ep_size: int = 1,
     mem_fraction_static: float = 0.25,
+    enable_decode_xpu_graph: bool = False,
+    enable_prefill_xpu_graph: bool = False,
+    warmup_requests: int = 0,
+    measure_ttft: bool = False,
+    decode_graph_batch_sizes: list[int] | None = None,
 ) -> dict[str, Any]:
     if tp_size < 1:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if warmup_requests < 0:
+        raise ValueError(f"warmup_requests must be non-negative, got {warmup_requests}")
+    if decode_graph_batch_sizes is not None and (
+        not decode_graph_batch_sizes
+        or any(batch_size < 1 for batch_size in decode_graph_batch_sizes)
+    ):
+        raise ValueError(
+            "decode_graph_batch_sizes must contain only positive batch sizes"
+        )
     if ep_size < 1 or tp_size % ep_size != 0:
         raise ValueError(
             f"ep_size={ep_size} must be a positive divisor of tp_size={tp_size}"
@@ -576,42 +568,82 @@ def run_engine(
     import sglang as sgl
 
     print(f"Using sgl_kernel overlay: {overlay}", flush=True)
+    decode_graph_batch_sizes = (
+        sorted(set(decode_graph_batch_sizes))
+        if decode_graph_batch_sizes is not None
+        else [1]
+    )
+    max_decode_batch_size = max(decode_graph_batch_sizes)
     engine = sgl.Engine(
         model_path=str(model_dir),
         tokenizer_path=str(model_dir),
         skip_tokenizer_init=True,
         trust_remote_code=True,
         load_format="safetensors",
+        model_loader_extra_config='{"enable_multithread_load": false}',
         dtype="bfloat16",
         device="xpu",
         tp_size=tp_size,
         ep_size=ep_size,
         attention_backend="intel_xpu",
         enable_multimodal=False,
-        max_running_requests=1,
+        max_running_requests=max_decode_batch_size,
         max_total_tokens=1024,
         context_length=128,
         swa_full_tokens_ratio=1.0,
         mem_fraction_static=mem_fraction_static,
-        disable_prefill_cuda_graph=True,
-        disable_decode_cuda_graph=True,
+        disable_prefill_cuda_graph=not enable_prefill_xpu_graph,
+        disable_decode_cuda_graph=not enable_decode_xpu_graph,
+        cuda_graph_backend_prefill=("full" if enable_prefill_xpu_graph else "disabled"),
+        cuda_graph_backend_decode=("full" if enable_decode_xpu_graph else "disabled"),
+        cuda_graph_bs_prefill=[prompt_len] if enable_prefill_xpu_graph else None,
+        cuda_graph_max_bs_prefill=prompt_len if enable_prefill_xpu_graph else None,
+        cuda_graph_bs_decode=(
+            decode_graph_batch_sizes if enable_decode_xpu_graph else None
+        ),
+        cuda_graph_max_bs_decode=max_decode_batch_size,
         skip_server_warmup=True,
         random_seed=0,
         log_level="info",
     )
     try:
         input_ids = list(range(3, 3 + prompt_len))
-        output = engine.generate(
-            input_ids=input_ids,
-            sampling_params={
+        for warmup_index in range(warmup_requests):
+            warmup_start = 10_000 + warmup_index * prompt_len
+            engine.generate(
+                input_ids=list(range(warmup_start, warmup_start + prompt_len)),
+                sampling_params={
+                    "temperature": 0.0,
+                    "max_new_tokens": max_new_tokens,
+                },
+            )
+        generate_started_at = time.perf_counter()
+        generate_kwargs = {
+            "input_ids": input_ids,
+            "sampling_params": {
                 "temperature": 0.0,
                 "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
+                # A first streamed chunk is only a TTFT observation if the
+                # scheduler is allowed to emit every generated token.
+                "stream_interval": 1 if measure_ttft else None,
             },
-            return_logprob=True,
-            logprob_start_len=0,
-            top_logprobs_num=1,
-        )
+            "return_logprob": True,
+            "logprob_start_len": 0,
+            "top_logprobs_num": 1,
+        }
+        ttft_s = None
+        first_stream_chunk_output_ids = None
+        if measure_ttft:
+            chunks = engine.generate(stream=True, **generate_kwargs)
+            output = next(chunks)
+            ttft_s = time.perf_counter() - generate_started_at
+            first_stream_chunk_output_ids = _extract_output_ids(output)
+            for output in chunks:
+                pass
+        else:
+            output = engine.generate(**generate_kwargs)
+        generate_elapsed_s = time.perf_counter() - generate_started_at
     finally:
         engine.shutdown()
 
@@ -628,6 +660,13 @@ def run_engine(
         )
     return {
         "tp_size": tp_size,
+        "decode_xpu_graph_enabled": enable_decode_xpu_graph,
+        "decode_graph_batch_sizes": decode_graph_batch_sizes,
+        "prefill_xpu_graph_enabled": enable_prefill_xpu_graph,
+        "warmup_requests": warmup_requests,
+        "generate_wall_time_s": generate_elapsed_s,
+        "ttft_s": ttft_s,
+        "first_stream_chunk_output_ids": first_stream_chunk_output_ids,
         "input_ids": input_ids,
         "output_ids": output_ids,
         "raw": output,

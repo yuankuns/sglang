@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 
-
 TP_SIZE = 4
 EP_SIZE = 1
 DEFAULT_XPU_AFFINITY_MASK = "4,5,6,7"
@@ -44,9 +43,7 @@ def model_size_summary() -> dict[str, int | float]:
         "bf16_equivalent_weight_bytes": BF16_TARGET_WEIGHT_BYTES,
         "mxfp4_mixed_weight_bytes": MXFP4_TARGET_WEIGHT_BYTES,
         "mxfp4_mixed_weight_gib": MXFP4_TARGET_WEIGHT_BYTES / 2**30,
-        "ideal_tp4_weight_gib_per_rank": (
-            MXFP4_TARGET_WEIGHT_BYTES / TP_SIZE / 2**30
-        ),
+        "ideal_tp4_weight_gib_per_rank": (MXFP4_TARGET_WEIGHT_BYTES / TP_SIZE / 2**30),
     }
 
 
@@ -74,6 +71,27 @@ def main() -> None:
     )
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
+    parser.add_argument(
+        "--enable-prefill-xpu-graph",
+        action="store_true",
+        help="Capture and replay the fixed prompt-length prefill graph",
+    )
+    parser.add_argument(
+        "--enable-decode-xpu-graph",
+        action="store_true",
+        help="Capture and replay the batch-one decode graph",
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help="Number of requests to run before the checked generation",
+    )
+    parser.add_argument(
+        "--measure-ttft",
+        action="store_true",
+        help="Measure time from generate submission to the first streamed chunk",
+    )
     parser.add_argument(
         "--xpu-affinity-mask",
         default=os.environ.get("ZE_AFFINITY_MASK", DEFAULT_XPU_AFFINITY_MASK),
@@ -154,6 +172,10 @@ def main() -> None:
         tp_size=TP_SIZE,
         ep_size=EP_SIZE,
         mem_fraction_static=0.80,
+        enable_prefill_xpu_graph=args.enable_prefill_xpu_graph,
+        enable_decode_xpu_graph=args.enable_decode_xpu_graph,
+        warmup_requests=args.warmup_requests,
+        measure_ttft=args.measure_ttft,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
