@@ -3,6 +3,9 @@
 
 The retained decoder stack is one minimum Inkling attention period:
 layers 0..4 use local/SWA attention and layer 5 uses global attention.
+Routed experts use OCP MXFP4 weights with the Xe2 W4A16 grouped GEMM, matching
+the TP4 reduced-model path. Attention, dense MLPs, gates, shared experts, and
+MTP layers remain BF16.
 
 Run from the SGLang repo inside an XPU-enabled container, for example:
 
@@ -20,6 +23,8 @@ import os
 from pathlib import Path
 
 TP_SIZE = 8
+EP_SIZE = 1
+CONTEXT_LENGTH = 6144
 DEFAULT_XPU_AFFINITY_MASK = "0,1,2,3,4,5,6,7"
 HIDDEN_SIZE = 6144
 INTERMEDIATE_SIZE = 3072
@@ -38,21 +43,24 @@ NUM_MTP_LAYERS = 8
 MTP_LOCAL_LAYER_IDS = (0, 2, 4, 5, 6, 7)
 TARGET_PARAMETER_COUNT = 62_437_775_878
 MTP_PARAMETER_COUNT = 5_046_437_896
-TARGET_WEIGHT_BYTES = 124_875_551_756
+BF16_TARGET_WEIGHT_BYTES = 124_875_551_756
+MXFP4_TARGET_WEIGHT_BYTES = 39_714_403_340
 MTP_WEIGHT_BYTES = 10_092_875_792
 
 
 def model_size_summary() -> dict[str, int | float]:
     parameter_count = TARGET_PARAMETER_COUNT + MTP_PARAMETER_COUNT
-    weight_bytes = TARGET_WEIGHT_BYTES + MTP_WEIGHT_BYTES
+    bf16_weight_bytes = BF16_TARGET_WEIGHT_BYTES + MTP_WEIGHT_BYTES
+    mxfp4_weight_bytes = MXFP4_TARGET_WEIGHT_BYTES + MTP_WEIGHT_BYTES
     return {
         "target_parameter_count": TARGET_PARAMETER_COUNT,
         "mtp_parameter_count": MTP_PARAMETER_COUNT,
         "parameter_count": parameter_count,
         "parameter_count_billions": parameter_count / 1e9,
-        "bf16_weight_bytes": weight_bytes,
-        "bf16_weight_gib": weight_bytes / 2**30,
-        "ideal_tp8_weight_gib_per_rank": weight_bytes / TP_SIZE / 2**30,
+        "bf16_equivalent_weight_bytes": bf16_weight_bytes,
+        "mxfp4_mixed_weight_bytes": mxfp4_weight_bytes,
+        "mxfp4_mixed_weight_gib": mxfp4_weight_bytes / 2**30,
+        "ideal_tp8_weight_gib_per_rank": mxfp4_weight_bytes / TP_SIZE / 2**30,
     }
 
 
@@ -65,28 +73,33 @@ def main() -> None:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("/workspace/tmp/sglang_fake_inkling_xpu_tp8_6layer"),
+        default=Path("/workspace/tmp/sglang_fake_inkling_xpu_tp8_6layer_mxfp4"),
     )
     parser.add_argument("--force", action="store_true", help="Regenerate checkpoint")
     parser.add_argument(
         "--size-only",
         action="store_true",
-        help="Print the exact reduced-model parameter and BF16 weight size",
+        help="Print the exact reduced-model mixed BF16/MXFP4 weight size",
     )
     parser.add_argument(
         "--allow-large-checkpoint",
         action="store_true",
-        help="Allow materializing the approximately 126 GiB fake checkpoint",
+        help="Allow materializing the approximately 46.4 GiB fake checkpoint",
     )
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--max-total-tokens", type=int, default=1024)
-    parser.add_argument("--context-length", type=int, default=128)
+    parser.add_argument("--context-length", type=int, default=CONTEXT_LENGTH)
     parser.add_argument(
         "--warmup-requests",
         type=int,
         default=0,
         help="Run this many unmeasured requests before the reported request",
+    )
+    parser.add_argument(
+        "--measure-ttft",
+        action="store_true",
+        help="Measure time from generate submission to the first streamed chunk",
     )
     parser.add_argument(
         "--enable-decode-xpu-graph",
@@ -117,7 +130,8 @@ def main() -> None:
         return
     if not args.allow_large_checkpoint:
         raise RuntimeError(
-            "The official-width reduced model is approximately 126 GiB in BF16. "
+            "The official-width reduced model is approximately 46.4 GiB with "
+            "MXFP4 routed experts. "
             "Use --size-only to inspect its capacity, or explicitly pass "
             "--allow-large-checkpoint to materialize it."
         )
@@ -169,6 +183,8 @@ def main() -> None:
         use_global_scale=True,
         num_mtp_layers=NUM_MTP_LAYERS,
         mtp_local_layer_ids=MTP_LOCAL_LAYER_IDS,
+        routed_experts_mxfp4=True,
+        max_position_embeddings=CONTEXT_LENGTH,
     )
     write_fake_inkling_checkpoint(
         args.model_dir,
@@ -176,15 +192,22 @@ def main() -> None:
         spec=spec,
         tp_size=TP_SIZE,
     )
+    from sglang.kernels.ops.moe.inkling_mxfp4_xpu_bridge import (
+        ensure_inkling_mxfp4_xpu_op,
+    )
+
+    ensure_inkling_mxfp4_xpu_op()
     result = run_engine(
         args.model_dir,
         args.prompt_len,
         args.max_new_tokens,
         tp_size=TP_SIZE,
+        ep_size=EP_SIZE,
         mem_fraction_static=0.90,
         enable_decode_xpu_graph=args.enable_decode_xpu_graph,
         enable_prefill_xpu_graph=args.enable_prefill_xpu_graph,
         warmup_requests=args.warmup_requests,
+        measure_ttft=args.measure_ttft,
         decode_graph_batch_sizes=args.decode_graph_batch_sizes,
         max_total_tokens=args.max_total_tokens,
         context_length=args.context_length,

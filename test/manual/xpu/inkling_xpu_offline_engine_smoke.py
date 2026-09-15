@@ -61,6 +61,7 @@ class ReducedInklingSpec:
     num_mtp_layers: int = 0
     mtp_local_layer_ids: tuple[int, ...] = ()
     routed_experts_mxfp4: bool = False
+    max_position_embeddings: int = 6144
 
     def validate(self, *, tp_size: int = 1) -> None:
         if tp_size < 1:
@@ -70,6 +71,11 @@ class ReducedInklingSpec:
         if self.num_mtp_layers < 0:
             raise ValueError(
                 f"num_mtp_layers must be non-negative, got {self.num_mtp_layers}"
+            )
+        if self.max_position_embeddings < 1:
+            raise ValueError(
+                "max_position_embeddings must be positive, got "
+                f"{self.max_position_embeddings}"
             )
         for name, value in (
             ("hidden_size", self.hidden_size),
@@ -241,7 +247,7 @@ def write_fake_inkling_checkpoint(
         "shared_expert_sink": spec.n_shared_experts > 0,
         "inference_moe_w13_interleaved": True,
         "tie_word_embeddings": False,
-        "max_position_embeddings": 128,
+        "max_position_embeddings": spec.max_position_embeddings,
         "num_nextn_predict_layers": spec.num_mtp_layers,
         "unpadded_vocab_size": spec.unpadded_vocab_size,
     }
