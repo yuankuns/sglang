@@ -2,8 +2,8 @@
 
 Mirrors FullCudaGraphBackend with XPU-specific differences:
   - Captures via torch.xpu.graph(xpu_graph=...) into torch.xpu.XPUGraph.
-  - Shares the global graph memory pool with the prefill backend so that
-    decode + prefill graphs occupy max(decode, prefill) rather than their sum.
+  - Uses one graph memory pool per backend. XPU cannot safely alias the decode
+    and prefill graph allocations even though the phases replay serially.
   - No set_graph_pool_id: SymmetricMemoryContext is never triggered on XPU
     (oneCCL has no ncclMemAlloc equivalent; enable_symm_mem defaults False).
 """
@@ -18,9 +18,6 @@ import torch
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
-)
-from sglang.srt.model_executor.runner_utils.pool import (
-    get_or_create_global_graph_memory_pool,
 )
 
 if TYPE_CHECKING:
@@ -47,7 +44,7 @@ class FullXPUGraphBackend(FullCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.xpu.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            self._pool = self._device_module.graph_pool_handle()
         self._capture_stream = stream
         try:
             yield

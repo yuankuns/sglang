@@ -22,7 +22,6 @@ from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     inkling_gate_topk_renorm_v2,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda
 
 
 @triton.jit
@@ -188,7 +187,7 @@ def sigmoid_gate_topk_renorm(
         and G == 258
         and logits.stride(0) % 8 == 0
         and logits.data_ptr() % 32 == 0
-        and is_cuda()
+        and logits.is_cuda
         and torch.version.hip is None
         and envs.SGLANG_OPT_USE_GATE_TOPK_JIT.get()
     ):
