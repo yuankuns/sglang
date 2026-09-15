@@ -1094,18 +1094,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(
                 layer.w2_weight.data.view(torch.int8), requires_grad=False
             )
-            # The serialized OCP scale is a biased UE8M0 exponent byte, while
-            # the Xe2 W4A16 kernel consumes its direct floating-point
-            # multiplier. This conversion is exact because every value is a
-            # power of two.
-            layer.w13_weight_scale = Parameter(
-                layer.w13_weight_scale.data.view(torch.float8_e8m0fnu).float(),
-                requires_grad=False,
-            )
-            layer.w2_weight_scale = Parameter(
-                layer.w2_weight_scale.data.view(torch.float8_e8m0fnu).float(),
-                requires_grad=False,
-            )
+            # Keep the serialized biased UE8M0 exponent bytes unchanged. The
+            # unified Xe2 W4A16 kernel in sgl-kernel-xpu main consumes uint8
+            # (or float8_e8m0fnu) scales directly.
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp

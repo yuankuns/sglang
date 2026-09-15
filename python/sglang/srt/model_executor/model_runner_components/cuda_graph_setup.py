@@ -227,12 +227,12 @@ def capture_cuda_graphs(
             available_memory_gb,
         )
 
-    # cuda-graph capture: prefill before decode, so both coalesce onto the
-    # eager buffer allocated above. (capture_prefill_graph routes prefill
-    # to the eager runner when the prefill graph is disabled.)
-    prefill = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
-    )
+    # Preserve the established prefill-first order on non-XPU backends.
+    prefill = None
+    if model_runner.device != "xpu":
+        prefill = capture_prefill_graph(
+            model_runner=model_runner, eager_runner=eager_runner
+        )
 
     decode_phase = "draft_decode" if model_runner.is_draft_worker else "decode"
     decode = GraphCapture(
@@ -254,6 +254,15 @@ def capture_cuda_graphs(
             memory_phase=decode_phase,
             memory_usage_gb=0,
             capture_time=0,
+        )
+
+    # XPU full graphs can retain addresses from shared model workspaces. Capture
+    # decode first so its setup cannot replace buffers already referenced by a
+    # prefill graph. Other backends retain the established prefill-first order
+    # so both captures coalesce onto the eager buffer allocated above.
+    if model_runner.device == "xpu":
+        prefill = capture_prefill_graph(
+            model_runner=model_runner, eager_runner=eager_runner
         )
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
