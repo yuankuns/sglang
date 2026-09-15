@@ -68,12 +68,17 @@ class FullXPUGraphBackend(FullCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = torch.xpu.XPUGraph()
+        graph = torch.xpu.XPUGraph(keep_graph=True)
 
         with self._device_module.graph(
             xpu_graph=graph, pool=self._pool, stream=self._capture_stream
         ):
             out = forward_fn()
+
+        # Prefill full-graph capture replays these per-layer graphs while an
+        # outer XPU graph is recording.  XPU cannot lazily prepare a graph on
+        # its first replay during another capture, so instantiate it eagerly.
+        graph.instantiate()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
