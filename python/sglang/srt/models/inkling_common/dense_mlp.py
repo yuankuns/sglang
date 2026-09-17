@@ -1,4 +1,5 @@
 import logging
+import os
 from enum import Enum
 
 import torch
@@ -124,6 +125,31 @@ class InklingDenseMLP(LlamaMLP):
         self.layer_id = layer_id
         self.act_fn = InklingSwiglu(interleaved=fused)
         self.scattered_sconv = get_exec().comm.enable_scattered_sconv
+        self.register_buffer("_gate_up_weight_t", None, persistent=False)
+        self.register_buffer("_down_weight_t", None, persistent=False)
+
+    def prepare_inkling_dense_gemm(self) -> None:
+        """Prepare immutable production-layout weights outside graph capture."""
+        # Keep opt-in until reduced-model E2E profiling shows a production win.
+        enabled = os.getenv("SGLANG_INKLING_DENSE_GEMM", "0") != "0"
+        gate_weight = getattr(self.gate_up_proj, "weight", None)
+        down_weight = getattr(self.down_proj, "weight", None)
+        supported = (
+            enabled
+            and gate_weight is not None
+            and down_weight is not None
+            and gate_weight.device.type == "xpu"
+            and gate_weight.dtype == torch.bfloat16
+            and down_weight.dtype == torch.bfloat16
+            and self.gate_up_proj.bias is None
+            and self.down_proj.bias is None
+        )
+        if not supported:
+            self._gate_up_weight_t = None
+            self._down_weight_t = None
+            return
+        self._gate_up_weight_t = gate_weight.t().contiguous()
+        self._down_weight_t = down_weight.t().contiguous()
 
     def forward(
         self,
@@ -131,7 +157,24 @@ class InklingDenseMLP(LlamaMLP):
         forward_batch: ForwardBatch | None = None,
         use_reduce_scatter: bool = False,
     ):
-        x = super().forward(x, forward_batch)
+        if self._gate_up_weight_t is not None:
+            from sgl_kernel import inkling_dense_gemm
+
+            # The tuned kernel wins for the mid-M gate/up shapes, while oneDNN
+            # remains faster for decode and the 4096-token packed-stride case.
+            if 32 < x.shape[0] <= 1024:
+                gate_up = inkling_dense_gemm(x, self._gate_up_weight_t)
+            else:
+                gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            # Down projection wins materially once there is enough M work;
+            # decode is within noise and avoids custom-op launch overhead.
+            if x.shape[0] > 32:
+                x = inkling_dense_gemm(x, self._down_weight_t)
+            else:
+                x, _ = self.down_proj(x)
+        else:
+            x = super().forward(x, forward_batch)
         if self.global_scale is not None:
             x = x * self.global_scale
         if not use_reduce_scatter and self.tp_group is not None:

@@ -1736,6 +1736,9 @@ class InklingForConditionalGeneration(nn.Module):
                     "llm.lm_head.weight",
                     embed_tokens_weight,
                 )
+        for module in self.modules():
+            if isinstance(module, InklingDenseMLP):
+                module.prepare_inkling_dense_gemm()
         return loaded_params
 
 
