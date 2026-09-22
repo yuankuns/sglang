@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -86,6 +87,28 @@ class _InklingArResources(msgspec.Struct):
 # communicator init (a normal, non-inference tensor) so producer GEMMs can
 # write into it -- including v4's input regions.
 _INKLING_AR_CACHE: dict[str, _InklingArResources] = {}
+
+
+@functools.cache
+def _deepsymm_collectives():
+    from deep_symm.collectives import (
+        allgather,
+        allreduce,
+        allreduce_sconv_add_rmsnorm,
+        reduce_scatter,
+    )
+
+    return allreduce, reduce_scatter, allgather, allreduce_sconv_add_rmsnorm
+
+
+def _deepsymm_group(group: GroupCoordinator, input: torch.Tensor):
+    if (
+        input.device.type != "xpu"
+        or os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0") == "0"
+        or torch.xpu.is_current_stream_capturing()
+    ):
+        return None
+    return group.device_group
 
 
 @functools.cache
@@ -244,6 +267,19 @@ def ar_sconv_norm_fusable(
     (kernels/ops/communication/inkling_ar_fused.py). Must be
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
+    if torch.xpu.is_available():
+        return (
+            os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0") != "0"
+            and os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
+            and forward_batch.forward_mode.is_decode()
+            and getattr(forward_batch, "mamba_track_mask", None) is None
+            and not torch.xpu.is_current_stream_capturing()
+            and dtype == torch.bfloat16
+            and group.world_size > 1
+            and 0 < num_tokens <= 256
+            and hidden == 6144
+            and num_tokens * hidden % group.world_size == 0
+        )
     if not is_cuda():
         return False
     if not (
@@ -297,6 +333,27 @@ def ar_sconv_norm_fused(
     the unfused ``sconv -> norm(hs, res)`` chain. The caller must have checked
     ``ar_sconv_norm_fusable``. Occupies one v5 staging rotation slot (this
     IS a v5 AR with the epilogue seam filled in; same reuse-distance rule)."""
+    if input.device.type == "xpu":
+        if shared is None:
+            shared = take_ar_shared(input.shape[0])
+        sconv_cache, cache_indices, cache_mask, conv_weight = (
+            sconv.decode_fused_ar_inputs(forward_batch)
+        )
+        return _deepsymm_collectives()[3](
+            input,
+            residual,
+            norm.weight,
+            sconv_cache,
+            cache_indices,
+            cache_mask,
+            conv_weight,
+            group.device_group,
+            eps=norm.variance_epsilon,
+            activation=sconv.activation,
+            use_residual=sconv.use_residual,
+            shared=shared,
+        )
+
     comm = group.torch_symm_mem_comm
     res = _get_inkling_ar_resources(comm)
     if shared is None:
@@ -585,6 +642,17 @@ def symm_mem_all_reduce(
 
     if shared is not None:
         input = input + shared
+    deepsymm_group = _deepsymm_group(group, input)
+    if deepsymm_group is not None:
+        result = _deepsymm_collectives()[0](
+            input,
+            deepsymm_group,
+            fallback=False,
+        )
+        if output is None:
+            return result
+        output.copy_(result)
+        return output
     result = group.all_reduce(input)
     if output is None:
         return result
@@ -632,6 +700,13 @@ def reduce_scatter_hidden(
     t, h = input.shape
     assert h % p == 0, f"hidden {h} not divisible by tp size {p}"
 
+    deepsymm_group = _deepsymm_group(group, input)
+    if deepsymm_group is not None:
+        rank_major = input.view(t, p, h // p).movedim(1, 0).contiguous().view(-1)
+        return _deepsymm_collectives()[1](
+            rank_major, deepsymm_group, fallback=False
+        ).view(t, h // p)
+
     comm = _symm_mem_comm(group, input, t * h)
     if comm is not None:
         # Stage [T,H] into the rendezvous'd symm buffer (no-op when the producer
@@ -659,6 +734,13 @@ def all_gather_hidden(input: torch.Tensor, group: GroupCoordinator) -> torch.Ten
     if p == 1:
         return input
     t, hp = input.shape
+
+    deepsymm_group = _deepsymm_group(group, input)
+    if deepsymm_group is not None:
+        rank_major = _deepsymm_collectives()[2](
+            input.contiguous().view(-1), deepsymm_group, fallback=False
+        )
+        return rank_major.view(p, t, hp).movedim(0, 1).reshape(t, p * hp)
 
     comm = _symm_mem_comm(group, input, t * hp * p)
     if comm is not None:
