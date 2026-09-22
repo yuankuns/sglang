@@ -81,6 +81,9 @@ _INKLING_DEEPSYMM_SHARED_AR = os.getenv("SGLANG_INKLING_DEEPSYMM_SHARED_AR", "1"
 _INKLING_DEEPSYMM_HIDDEN_ALLGATHER = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_ALLGATHER", "1") != "0"
 )
+_INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER", "1") != "0"
+)
 
 
 class _InklingArResources(msgspec.Struct):
@@ -124,6 +127,7 @@ def _deepsymm_collectives():
         getattr(collectives, "fullwidth_allreduce_sconv", None),
         getattr(collectives, "allreduce_shared", None),
         getattr(collectives, "allgather_hidden", None),
+        getattr(collectives, "reduce_scatter_hidden", None),
     )
 
 
@@ -782,6 +786,14 @@ def reduce_scatter_hidden(
 
     deepsymm_group = _deepsymm_group(group, input)
     if deepsymm_group is not None:
+        hidden_reduce_scatter = _deepsymm_collectives()[9]
+        if (
+            _INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER
+            and hidden_reduce_scatter is not None
+        ):
+            return hidden_reduce_scatter(
+                input.contiguous(), deepsymm_group, fallback=False
+            )
         rank_major = input.view(t, p, h // p).movedim(1, 0).contiguous().view(-1)
         return _deepsymm_collectives()[1](
             rank_major, deepsymm_group, fallback=False
