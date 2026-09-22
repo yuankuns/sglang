@@ -77,6 +77,9 @@ _INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM = (
 _INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV", "1") != "0"
 )
+_INKLING_DEEPSYMM_SHARED_AR = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_SHARED_AR", "1") != "0"
+)
 
 
 class _InklingArResources(msgspec.Struct):
@@ -118,6 +121,7 @@ def _deepsymm_collectives():
         getattr(collectives, "reduce_scatter_sconv_allgather", None),
         getattr(collectives, "allreduce_save_sconv_windows_verify", None),
         getattr(collectives, "fullwidth_allreduce_sconv", None),
+        getattr(collectives, "allreduce_shared", None),
     )
 
 
@@ -701,19 +705,36 @@ def symm_mem_all_reduce(
         torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", comm.group.group_name)
         return buf.view(input.shape)
 
-    if shared is not None:
-        input = input + shared
     deepsymm_group = _deepsymm_group(group, input)
     if deepsymm_group is not None:
-        result = _deepsymm_collectives()[0](
-            input,
-            deepsymm_group,
-            fallback=False,
-        )
+        collectives = _deepsymm_collectives()
+        num_tokens = input.shape[0] if input.dim() >= 2 else input.numel()
+        if (
+            shared is not None
+            and _INKLING_DEEPSYMM_SHARED_AR
+            and num_tokens <= 96
+            and collectives[7] is not None
+        ):
+            result = collectives[7](
+                input.contiguous(),
+                shared.contiguous(),
+                deepsymm_group,
+                fallback=False,
+            )
+        else:
+            if shared is not None:
+                input = input + shared
+            result = collectives[0](
+                input,
+                deepsymm_group,
+                fallback=False,
+            )
         if output is None:
             return result
         output.copy_(result)
         return output
+    if shared is not None:
+        input = input + shared
     result = group.all_reduce(input)
     if output is None:
         return result
