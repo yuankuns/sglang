@@ -65,6 +65,9 @@ _INKLING_DEEPSYMM_ALLREDUCE = os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0"
 _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
 )
+_INKLING_DEEPSYMM_VERIFY_AR_WINDOW = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_VERIFY_AR_WINDOW", "0") != "0"
+)
 _INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV", "1") != "0"
 )
@@ -102,20 +105,15 @@ _INKLING_AR_CACHE: dict[str, _InklingArResources] = {}
 
 @functools.cache
 def _deepsymm_collectives():
-    from deep_symm.collectives import (
-        allgather,
-        allreduce,
-        allreduce_sconv_add_rmsnorm,
-        reduce_scatter,
-        reduce_scatter_sconv_allgather,
-    )
+    from deep_symm import collectives
 
     return (
-        allreduce,
-        reduce_scatter,
-        allgather,
-        allreduce_sconv_add_rmsnorm,
-        reduce_scatter_sconv_allgather,
+        collectives.allreduce,
+        collectives.reduce_scatter,
+        collectives.allgather,
+        collectives.allreduce_sconv_add_rmsnorm,
+        getattr(collectives, "reduce_scatter_sconv_allgather", None),
+        getattr(collectives, "allreduce_save_sconv_windows_verify", None),
     )
 
 
@@ -286,11 +284,27 @@ def ar_sconv_norm_fusable(
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
     if torch.xpu.is_available():
-        return (
-            _INKLING_DEEPSYMM_ALLREDUCE
+        fm = forward_batch.forward_mode
+        mode_enabled = (
+            fm.is_target_verify()
+            and _INKLING_DEEPSYMM_VERIFY_AR_WINDOW
+        ) or (
+            fm.is_decode()
+            and _INKLING_DEEPSYMM_ALLREDUCE
             and _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM
-            and forward_batch.forward_mode.is_decode()
-            and getattr(forward_batch, "mamba_track_mask", None) is None
+        )
+        return (
+            mode_enabled
+            and not get_exec().comm.enable_scattered_sconv
+            and (fm.is_decode() or fm.is_target_verify())
+            and (
+                not fm.is_decode()
+                or getattr(forward_batch, "mamba_track_mask", None) is None
+            )
+            and (
+                not fm.is_target_verify()
+                or _deepsymm_collectives()[5] is not None
+            )
             and not torch.xpu.is_current_stream_capturing()
             and dtype == torch.bfloat16
             and group.world_size > 1
@@ -353,6 +367,32 @@ def ar_sconv_norm_fused(
     if input.device.type == "xpu":
         if shared is None:
             shared = take_ar_shared(input.shape[0])
+        if forward_batch.forward_mode.is_target_verify():
+            sconv_cache, cache_indices, cache_mask, conv_weight, inter_out = (
+                sconv.verify_fused_ar_inputs(forward_batch)
+            )
+            verify_op = _deepsymm_collectives()[5]
+            assert verify_op is not None
+            reduced = verify_op(
+                input,
+                residual,
+                norm.weight,
+                sconv_cache,
+                cache_indices,
+                cache_mask,
+                conv_weight,
+                inter_out,
+                forward_batch.spec_info.draft_token_num,
+                group.device_group,
+                shared=shared,
+            )
+            meta = sconv._conv_state(forward_batch)
+            hs = sconv._apply_causal_sconv_kernel(
+                hidden_states=reduced,
+                sconv_cache=sconv_cache,
+                precomputed=meta.precomputed,
+            )
+            return norm(hs, residual)
         sconv_cache, cache_indices, cache_mask, conv_weight = (
             sconv.decode_fused_ar_inputs(forward_batch)
         )
@@ -911,7 +951,9 @@ def ar_scattered_sconv_fused(
         )
         if fuse_norm:
             assert norm_residual is not None
-        gathered = _deepsymm_collectives()[4](
+        scattered_op = _deepsymm_collectives()[4]
+        assert scattered_op is not None
+        gathered = scattered_op(
             rank_major,
             sconv_cache,
             cache_indices,

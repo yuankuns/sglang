@@ -116,6 +116,7 @@ class DraftBackendFactory:
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
             "intel_amx": self._create_intel_amx_prefill_backend,
+            "intel_xpu": self._create_intel_xpu_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
@@ -155,6 +156,17 @@ class DraftBackendFactory:
             )
             wrapped.decode_attention_backend_str = backend.decode_attention_backend_str
         return wrapped
+
+    def _create_intel_xpu_prefill_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        return (
+            "intel_xpu",
+            XPUAttentionBackend(
+                self.draft_model_runner,
+                speculative_num_steps=self.speculative_num_steps,
+            ),
+        )
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (

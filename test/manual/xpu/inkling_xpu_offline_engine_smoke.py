@@ -547,6 +547,11 @@ def run_engine(
     max_total_tokens: int = 1024,
     context_length: int = 128,
     enable_scattered_sconv: bool = False,
+    speculative_algorithm: str | None = None,
+    speculative_num_steps: int | None = None,
+    speculative_eagle_topk: int | None = None,
+    speculative_num_draft_tokens: int | None = None,
+    enable_multi_layer_eagle: bool = False,
 ) -> dict[str, Any]:
     if tp_size < 1:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
@@ -603,6 +608,11 @@ def run_engine(
         ep_size=ep_size,
         attention_backend="intel_xpu",
         enable_scattered_sconv=enable_scattered_sconv,
+        speculative_algorithm=speculative_algorithm,
+        speculative_num_steps=speculative_num_steps,
+        speculative_eagle_topk=speculative_eagle_topk,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        enable_multi_layer_eagle=enable_multi_layer_eagle,
         enable_multimodal=False,
         max_running_requests=max_decode_batch_size,
         max_total_tokens=max_total_tokens,
@@ -677,6 +687,9 @@ def run_engine(
         )
     return {
         "tp_size": tp_size,
+        "speculative_algorithm": speculative_algorithm,
+        "speculative_num_steps": speculative_num_steps,
+        "speculative_num_draft_tokens": speculative_num_draft_tokens,
         "decode_xpu_graph_enabled": enable_decode_xpu_graph,
         "decode_graph_batch_sizes": decode_graph_batch_sizes,
         "prefill_xpu_graph_enabled": enable_prefill_xpu_graph,

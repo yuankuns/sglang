@@ -5,7 +5,7 @@ The 66-layer target is [5 local + 1 global] repeated eleven times. This model
 retains exactly one six-layer period, including the two dense layers followed
 by four 256-expert MoE layers. Only routed expert storage is changed to OCP
 MXFP4; attention, dense MLPs, gates, and shared experts remain BF16. Optional
-MTP is omitted.
+MTP is optional and can be enabled to exercise NEXTN target verification.
 """
 
 from __future__ import annotations
@@ -77,6 +77,14 @@ def main() -> None:
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument(
+        "--num-mtp-layers",
+        type=int,
+        default=0,
+        help="Materialize this many MTP layers and run NEXTN when nonzero",
+    )
+    parser.add_argument("--speculative-num-steps", type=int, default=3)
+    parser.add_argument("--speculative-num-draft-tokens", type=int, default=4)
+    parser.add_argument(
         "--enable-scattered-sconv",
         action="store_true",
         help="Run the column-sharded SConv communication path",
@@ -108,6 +116,12 @@ def main() -> None:
         help="Four healthy physical XPU indices to expose",
     )
     args = parser.parse_args()
+    if args.num_mtp_layers < 0:
+        raise ValueError("--num-mtp-layers must be non-negative")
+    if args.num_mtp_layers and args.speculative_num_steps > args.num_mtp_layers:
+        raise ValueError(
+            "--speculative-num-steps cannot exceed --num-mtp-layers"
+        )
 
     if args.size_only:
         print(json.dumps(model_size_summary(), indent=2, sort_keys=True))
@@ -161,7 +175,8 @@ def main() -> None:
         num_experts_per_tok=NUM_EXPERTS_PER_TOK,
         use_embed_norm=True,
         use_global_scale=True,
-        num_mtp_layers=0,
+        num_mtp_layers=args.num_mtp_layers,
+        mtp_local_layer_ids=(),
         routed_experts_mxfp4=True,
     )
     if args.reuse_existing_checkpoint:
@@ -196,6 +211,15 @@ def main() -> None:
         warmup_requests=args.warmup_requests,
         measure_ttft=args.measure_ttft,
         enable_scattered_sconv=args.enable_scattered_sconv,
+        speculative_algorithm=("NEXTN" if args.num_mtp_layers else None),
+        speculative_num_steps=(
+            args.speculative_num_steps if args.num_mtp_layers else None
+        ),
+        speculative_eagle_topk=(1 if args.num_mtp_layers else None),
+        speculative_num_draft_tokens=(
+            args.speculative_num_draft_tokens if args.num_mtp_layers else None
+        ),
+        enable_multi_layer_eagle=bool(args.num_mtp_layers),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

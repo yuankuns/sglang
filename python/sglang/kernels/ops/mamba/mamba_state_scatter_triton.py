@@ -557,14 +557,17 @@ def _fused_conv_window_scatter_multi_kernel(
 
 
 def _conv_multi_build_meta(pairs, block_size: int):
+    def as_signed_int64(value: int) -> int:
+        return value - (1 << 64) if value >= (1 << 63) else value
+
     rows = []
     block_start = 0
     for dst, src in pairs:
         elem = dst.shape[2] * dst.shape[3]
         rows.append(
             [
-                src.data_ptr(),
-                dst.data_ptr(),
+                as_signed_int64(src.data_ptr()),
+                as_signed_int64(dst.data_ptr()),
                 elem,
                 src.stride(0),
                 src.stride(1),
