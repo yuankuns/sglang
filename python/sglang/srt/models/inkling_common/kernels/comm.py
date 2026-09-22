@@ -74,6 +74,9 @@ _INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV = (
 _INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM", "0") != "0"
 )
+_INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV", "1") != "0"
+)
 
 
 class _InklingArResources(msgspec.Struct):
@@ -114,6 +117,7 @@ def _deepsymm_collectives():
         collectives.allreduce_sconv_add_rmsnorm,
         getattr(collectives, "reduce_scatter_sconv_allgather", None),
         getattr(collectives, "allreduce_save_sconv_windows_verify", None),
+        getattr(collectives, "fullwidth_allreduce_sconv", None),
     )
 
 
@@ -1228,7 +1232,16 @@ def fullwidth_ar_sconv_fusable(
     it identically. Mutually exclusive with ``ar_sconv_norm_fusable`` by mode
     (extend vs decode/verify) and with ``scattered_ar_sconv_fusable`` by the
     scattered flag."""
-    if not is_cuda():
+    is_xpu = torch.xpu.is_available() and not is_cuda()
+    if is_xpu:
+        if not _INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV:
+            return False
+        if torch.xpu.is_current_stream_capturing():
+            return False
+        track_mask = getattr(forward_batch, "mamba_track_mask", None)
+        if track_mask is not None and track_mask.numel() != 0:
+            return False
+    elif not is_cuda():
         return False
     if not (
         not get_exec().comm.enable_scattered_sconv
@@ -1243,8 +1256,18 @@ def fullwidth_ar_sconv_fusable(
         return False  # verify needs the window save (need_scratch); v5 covers it
     if not fm.is_extend():
         return False
-    if num_tokens < _INKLING_AR_FW_MIN_TOKENS:
+    min_tokens = 8192 if is_xpu else _INKLING_AR_FW_MIN_TOKENS
+    if num_tokens < min_tokens:
         return False
+    if is_xpu:
+        return (
+            group.world_size == 4
+            and dtype == torch.bfloat16
+            and num_tokens % group.world_size == 0
+            and hidden % (group.world_size * _INKLING_AR_VEC) == 0
+            and _deepsymm_collectives()[6] is not None
+            and group.device_group is not None
+        )
     # Same prefill-runner scope as the scattered gate: BCG / tc_piecewise
     # pieces can't carry the cross-layer producer contract; the FULL prefill
     # CUDA-graph backend is supported (capture-safe kernel, in-graph metadata).
@@ -1289,6 +1312,44 @@ def ar_fullwidth_sconv_fused(
     (a view of the OUT symm region); the caller runs the norm unfused (the
     in-kernel tail is slower at extend shapes, see
     ``ar_scattered_sconv_fused``)."""
+    if input.device.type == "xpu":
+        shared = take_ar_shared(input.shape[0])
+        if shared is not None:
+            input = input + shared
+        (
+            sconv_cache,
+            safe_idx,
+            cache_mask,
+            cu,
+            si,
+            weight,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            track_rows,
+            track_mask,
+            track_dst,
+        ) = sconv.extend_fused_ar_inputs(forward_batch)
+        if track_rows.numel() or track_mask.numel() or track_dst.numel():
+            raise RuntimeError(
+                "DeepSymm full-width fusion does not support prefix tracking"
+            )
+        return _deepsymm_collectives()[6](
+            input.contiguous(),
+            sconv_cache,
+            safe_idx,
+            cache_mask,
+            cu,
+            si,
+            weight,
+            query_start_loc.to(torch.int32),
+            cache_indices.to(torch.int32),
+            has_initial_state,
+            group.device_group,
+            activation=sconv.activation,
+            use_residual=sconv.use_residual,
+        )
+
     shared = take_ar_shared(input.shape[0])
     if shared is not None:
         # Pre-add on this path rather than folding in-kernel: pre-add keeps the
