@@ -1084,6 +1084,8 @@ class InklingMoE(nn.Module):
 
         tp = get_tensor_model_parallel_group()
         if shared_out is not None:
+            if self._fused_ar_shared and self.scattered_sconv:
+                return reduce_scatter_hidden(out, tp, shared=shared_out)
             if self._fused_ar_shared and not self.scattered_sconv:
                 # The AR dispatch folds in-kernel on the fold paths and pre-adds
                 # during its stage-in otherwise -- never worse than the explicit

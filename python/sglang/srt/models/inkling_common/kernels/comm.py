@@ -84,6 +84,9 @@ _INKLING_DEEPSYMM_HIDDEN_ALLGATHER = (
 _INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER", "1") != "0"
 )
+_INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER_SHARED = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER_SHARED", "1") != "0"
+)
 
 
 class _InklingArResources(msgspec.Struct):
@@ -128,6 +131,7 @@ def _deepsymm_collectives():
         getattr(collectives, "allreduce_shared", None),
         getattr(collectives, "allgather_hidden", None),
         getattr(collectives, "reduce_scatter_hidden", None),
+        getattr(collectives, "reduce_scatter_hidden_shared", None),
     )
 
 
@@ -776,16 +780,31 @@ def reduce_scatter_hidden(
     group: GroupCoordinator,
     *,
     input_is_ar_buffer: bool = False,
+    shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reduce partial-sum [T, H] across the group, scatter hidden -> [T, H/P]."""
     p = group.world_size
     if p == 1:
-        return input
+        return input if shared is None else input + shared
     t, h = input.shape
     assert h % p == 0, f"hidden {h} not divisible by tp size {p}"
 
     deepsymm_group = _deepsymm_group(group, input)
     if deepsymm_group is not None:
+        shared_reduce_scatter = _deepsymm_collectives()[10]
+        if (
+            shared is not None
+            and _INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER_SHARED
+            and shared_reduce_scatter is not None
+        ):
+            return shared_reduce_scatter(
+                input.contiguous(),
+                shared.contiguous(),
+                deepsymm_group,
+                fallback=False,
+            )
+        if shared is not None:
+            input = input + shared
         hidden_reduce_scatter = _deepsymm_collectives()[9]
         if (
             _INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER
@@ -798,6 +817,10 @@ def reduce_scatter_hidden(
         return _deepsymm_collectives()[1](
             rank_major, deepsymm_group, fallback=False
         ).view(t, h // p)
+
+    if shared is not None:
+        input = input + shared
+        input_is_ar_buffer = False
 
     comm = _symm_mem_comm(group, input, t * h)
     if comm is not None:
