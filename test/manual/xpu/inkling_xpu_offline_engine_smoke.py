@@ -546,6 +546,7 @@ def run_engine(
     decode_graph_batch_sizes: list[int] | None = None,
     max_total_tokens: int = 1024,
     context_length: int = 128,
+    enable_scattered_sconv: bool = False,
 ) -> dict[str, Any]:
     if tp_size < 1:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
@@ -601,6 +602,7 @@ def run_engine(
         tp_size=tp_size,
         ep_size=ep_size,
         attention_backend="intel_xpu",
+        enable_scattered_sconv=enable_scattered_sconv,
         enable_multimodal=False,
         max_running_requests=max_decode_batch_size,
         max_total_tokens=max_total_tokens,

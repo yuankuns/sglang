@@ -60,6 +60,11 @@ def main() -> None:
     )
     parser.add_argument("--force", action="store_true", help="Regenerate checkpoint")
     parser.add_argument(
+        "--reuse-existing-checkpoint",
+        action="store_true",
+        help="Use an existing runnable checkpoint without regenerating its manifest",
+    )
+    parser.add_argument(
         "--size-only",
         action="store_true",
         help="Print the exact six-layer mixed BF16/MXFP4 weight size",
@@ -71,6 +76,11 @@ def main() -> None:
     )
     parser.add_argument("--prompt-len", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2)
+    parser.add_argument(
+        "--enable-scattered-sconv",
+        action="store_true",
+        help="Run the column-sharded SConv communication path",
+    )
     parser.add_argument(
         "--enable-prefill-xpu-graph",
         action="store_true",
@@ -154,12 +164,21 @@ def main() -> None:
         num_mtp_layers=0,
         routed_experts_mxfp4=True,
     )
-    write_fake_inkling_checkpoint(
-        args.model_dir,
-        force=args.force,
-        spec=spec,
-        tp_size=TP_SIZE,
-    )
+    if args.reuse_existing_checkpoint:
+        required = (
+            args.model_dir / "config.json",
+            args.model_dir / "model.safetensors",
+        )
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"missing checkpoint files: {missing}")
+    else:
+        write_fake_inkling_checkpoint(
+            args.model_dir,
+            force=args.force,
+            spec=spec,
+            tp_size=TP_SIZE,
+        )
     from sglang.kernels.ops.moe.inkling_mxfp4_xpu_bridge import (
         ensure_inkling_mxfp4_xpu_op,
     )
@@ -176,6 +195,7 @@ def main() -> None:
         enable_decode_xpu_graph=args.enable_decode_xpu_graph,
         warmup_requests=args.warmup_requests,
         measure_ttft=args.measure_ttft,
+        enable_scattered_sconv=args.enable_scattered_sconv,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

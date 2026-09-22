@@ -61,6 +61,17 @@ _INKLING_AR_SSCONV_OUT_REGION = 16384 * 6144  # max_prefill_tokens x hidden
 # with it the custom kernels) is only taken for these.
 _INKLING_AR_WORLD_SIZES = (4, 6, 8)
 
+_INKLING_DEEPSYMM_ALLREDUCE = os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0") != "0"
+_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
+)
+_INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV", "1") != "0"
+)
+_INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM", "0") != "0"
+)
+
 
 class _InklingArResources(msgspec.Struct):
     """Per-group custom-AR resources: barrier flags/state + comm.buffer peer and
@@ -96,15 +107,22 @@ def _deepsymm_collectives():
         allreduce,
         allreduce_sconv_add_rmsnorm,
         reduce_scatter,
+        reduce_scatter_sconv_allgather,
     )
 
-    return allreduce, reduce_scatter, allgather, allreduce_sconv_add_rmsnorm
+    return (
+        allreduce,
+        reduce_scatter,
+        allgather,
+        allreduce_sconv_add_rmsnorm,
+        reduce_scatter_sconv_allgather,
+    )
 
 
 def _deepsymm_group(group: GroupCoordinator, input: torch.Tensor):
     if (
         input.device.type != "xpu"
-        or os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0") == "0"
+        or not _INKLING_DEEPSYMM_ALLREDUCE
         or torch.xpu.is_current_stream_capturing()
     ):
         return None
@@ -269,15 +287,14 @@ def ar_sconv_norm_fusable(
     consuming layer/tail -- it is a pure function of per-forward state."""
     if torch.xpu.is_available():
         return (
-            os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0") != "0"
-            and os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
+            _INKLING_DEEPSYMM_ALLREDUCE
+            and _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM
             and forward_batch.forward_mode.is_decode()
             and getattr(forward_batch, "mamba_track_mask", None) is None
             and not torch.xpu.is_current_stream_capturing()
             and dtype == torch.bfloat16
             and group.world_size > 1
             and 0 < num_tokens <= 256
-            and hidden == 6144
             and num_tokens * hidden % group.world_size == 0
         )
     if not is_cuda():
@@ -778,6 +795,18 @@ def scattered_ar_sconv_fusable(
     per-forward
     state -- the producing layer (reduce=False) and the consuming site must
     evaluate it identically."""
+    if torch.xpu.is_available():
+        return (
+            _INKLING_DEEPSYMM_ALLREDUCE
+            and _INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV
+            and get_exec().comm.enable_scattered_sconv
+            and forward_batch.forward_mode.is_decode()
+            and not torch.xpu.is_current_stream_capturing()
+            and dtype == torch.bfloat16
+            and group.world_size > 1
+            and hidden % group.world_size == 0
+            and 0 < num_tokens <= 256
+        )
     if not is_cuda():
         return False
     if not (
@@ -863,6 +892,48 @@ def ar_scattered_sconv_fused(
             input = _buf
         else:
             input = input + shared
+
+    if input.device.type == "xpu":
+        world = group.world_size
+        t, h = input.shape
+        hc = h // world
+        sconv_cache, cache_indices, cache_mask, weight = sconv.decode_fused_ar_inputs(
+            forward_batch
+        )
+        rank_major = input.view(t, world, hc).movedim(1, 0).contiguous()
+        track_mask = getattr(forward_batch, "mamba_track_mask", None)
+        track_indices = getattr(forward_batch, "mamba_track_indices", None)
+        if track_mask is not None:
+            track_mask = track_mask[:t]
+            track_indices = track_indices[:t]
+        fuse_norm = (
+            _INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM and norm is not None and t == 1
+        )
+        if fuse_norm:
+            assert norm_residual is not None
+        gathered = _deepsymm_collectives()[4](
+            rank_major,
+            sconv_cache,
+            cache_indices,
+            cache_mask,
+            weight,
+            group.device_group,
+            activation=sconv.activation,
+            use_residual=sconv.use_residual,
+            track_mask=track_mask,
+            track_indices=track_indices,
+            residual=norm_residual.view(-1) if fuse_norm else None,
+            norm_weight=norm.weight.data if fuse_norm else None,
+            eps=float(norm.variance_epsilon) if fuse_norm else 1e-6,
+        )
+        if fuse_norm:
+            norm_out, residual_out = gathered
+            return norm_out.view(t, h), residual_out.view(t, h)
+        hidden = gathered.movedim(0, 1).reshape(t, h)
+        if norm is None:
+            return hidden
+        assert norm_residual is not None
+        return norm(hidden, norm_residual)
 
     comm = group.torch_symm_mem_comm
     res = _get_inkling_ar_resources(comm)
