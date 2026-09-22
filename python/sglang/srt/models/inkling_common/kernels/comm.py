@@ -77,8 +77,9 @@ _INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM = (
 _INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV", "1") != "0"
 )
-_INKLING_DEEPSYMM_SHARED_AR = (
-    os.getenv("SGLANG_INKLING_DEEPSYMM_SHARED_AR", "1") != "0"
+_INKLING_DEEPSYMM_SHARED_AR = os.getenv("SGLANG_INKLING_DEEPSYMM_SHARED_AR", "1") != "0"
+_INKLING_DEEPSYMM_HIDDEN_ALLGATHER = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_ALLGATHER", "1") != "0"
 )
 
 
@@ -122,6 +123,7 @@ def _deepsymm_collectives():
         getattr(collectives, "allreduce_save_sconv_windows_verify", None),
         getattr(collectives, "fullwidth_allreduce_sconv", None),
         getattr(collectives, "allreduce_shared", None),
+        getattr(collectives, "allgather_hidden", None),
     )
 
 
@@ -294,8 +296,7 @@ def ar_sconv_norm_fusable(
     if torch.xpu.is_available():
         fm = forward_batch.forward_mode
         mode_enabled = (
-            fm.is_target_verify()
-            and _INKLING_DEEPSYMM_VERIFY_AR_WINDOW
+            fm.is_target_verify() and _INKLING_DEEPSYMM_VERIFY_AR_WINDOW
         ) or (
             fm.is_decode()
             and _INKLING_DEEPSYMM_ALLREDUCE
@@ -309,10 +310,7 @@ def ar_sconv_norm_fusable(
                 not fm.is_decode()
                 or getattr(forward_batch, "mamba_track_mask", None) is None
             )
-            and (
-                not fm.is_target_verify()
-                or _deepsymm_collectives()[5] is not None
-            )
+            and (not fm.is_target_verify() or _deepsymm_collectives()[5] is not None)
             and not torch.xpu.is_current_stream_capturing()
             and dtype == torch.bfloat16
             and group.world_size > 1
@@ -819,6 +817,9 @@ def all_gather_hidden(input: torch.Tensor, group: GroupCoordinator) -> torch.Ten
 
     deepsymm_group = _deepsymm_group(group, input)
     if deepsymm_group is not None:
+        hidden_allgather = _deepsymm_collectives()[8]
+        if _INKLING_DEEPSYMM_HIDDEN_ALLGATHER and hidden_allgather is not None:
+            return hidden_allgather(input.contiguous(), deepsymm_group, fallback=False)
         rank_major = _deepsymm_collectives()[2](
             input.contiguous().view(-1), deepsymm_group, fallback=False
         )
