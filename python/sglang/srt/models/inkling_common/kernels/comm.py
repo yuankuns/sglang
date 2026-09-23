@@ -66,7 +66,7 @@ _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
 )
 _INKLING_DEEPSYMM_VERIFY_AR_WINDOW = (
-    os.getenv("SGLANG_INKLING_DEEPSYMM_VERIFY_AR_WINDOW", "0") != "0"
+    os.getenv("SGLANG_INKLING_DEEPSYMM_VERIFY_AR_WINDOW", "1") != "0"
 )
 _INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV", "1") != "0"
@@ -129,7 +129,7 @@ def _deepsymm_collectives():
         collectives.allgather,
         collectives.allreduce_sconv_add_rmsnorm,
         getattr(collectives, "reduce_scatter_sconv_allgather", None),
-        getattr(collectives, "allreduce_save_sconv_windows_verify", None),
+        getattr(collectives, "allreduce_sconv_add_rmsnorm_verify", None),
         getattr(collectives, "fullwidth_allreduce_sconv", None),
         getattr(collectives, "allreduce_shared", None),
         getattr(collectives, "allgather_hidden", None),
@@ -391,7 +391,7 @@ def ar_sconv_norm_fused(
             )
             verify_op = _deepsymm_collectives()[5]
             assert verify_op is not None
-            reduced = verify_op(
+            hs, residual_out, _ = verify_op(
                 input,
                 residual,
                 norm.weight,
@@ -402,15 +402,12 @@ def ar_sconv_norm_fused(
                 inter_out,
                 forward_batch.spec_info.draft_token_num,
                 group.device_group,
+                eps=norm.variance_epsilon,
+                activation=sconv.activation,
+                use_residual=sconv.use_residual,
                 shared=shared,
             )
-            meta = sconv._conv_state(forward_batch)
-            hs = sconv._apply_causal_sconv_kernel(
-                hidden_states=reduced,
-                sconv_cache=sconv_cache,
-                precomputed=meta.precomputed,
-            )
-            return norm(hs, residual)
+            return hs, residual_out
         sconv_cache, cache_indices, cache_mask, conv_weight = (
             sconv.decode_fused_ar_inputs(forward_batch)
         )
