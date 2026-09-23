@@ -54,6 +54,7 @@ from sglang.srt.models.inkling_common.dense_mlp import InklingDenseMLP
 from sglang.srt.models.inkling_common.hmlp import HMLPPatchEncoder
 from sglang.srt.models.inkling_common.kernels.comm import (
     all_gather_hidden,
+    all_gather_hidden_add_rmsnorm,
     ar_fullwidth_sconv_fused,
     ar_scattered_sconv_fused,
     ar_sconv_norm_fusable,
@@ -342,19 +343,26 @@ class InklingDecoderLayer(nn.Module):
                 )
                 hs, res = self.attn_norm(hs, res)
         else:
+            hidden_gather_norm_done = False
             if prev_mlp_sconv is not None:
                 hs = prev_mlp_sconv(hs, positions, forward_batch)
                 if self.scattered_sconv:
                     # hs was the previous layer's reduce-scattered [T, H/P] MoE
                     # shard; gather back to [T, H] before the residual add.
-                    hs = all_gather_hidden(hs, self.attn_tp_group)
+                    if res is None:
+                        hs = all_gather_hidden(hs, self.attn_tp_group)
+                    else:
+                        hs, res = all_gather_hidden_add_rmsnorm(
+                            hs, res, self.attn_norm, self.attn_tp_group
+                        )
+                        hidden_gather_norm_done = True
 
             # Fused residual-add + norm for attention input. First layer: no prior
             # residual yet, so just norm the (post-deferred-sconv) embeddings.
             if res is None:
                 res = hs
                 hs = self.attn_norm(hs)
-            else:
+            elif not hidden_gather_norm_done:
                 hs, res = self.attn_norm(hs, res)
 
         if eager_attn:

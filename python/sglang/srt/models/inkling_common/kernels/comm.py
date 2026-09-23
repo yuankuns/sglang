@@ -81,6 +81,9 @@ _INKLING_DEEPSYMM_SHARED_AR = os.getenv("SGLANG_INKLING_DEEPSYMM_SHARED_AR", "1"
 _INKLING_DEEPSYMM_HIDDEN_ALLGATHER = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_ALLGATHER", "1") != "0"
 )
+_INKLING_DEEPSYMM_HIDDEN_ALLGATHER_NORM = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_ALLGATHER_NORM", "1") != "0"
+)
 _INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_HIDDEN_REDUCE_SCATTER", "1") != "0"
 )
@@ -132,6 +135,7 @@ def _deepsymm_collectives():
         getattr(collectives, "allgather_hidden", None),
         getattr(collectives, "reduce_scatter_hidden", None),
         getattr(collectives, "reduce_scatter_hidden_shared", None),
+        getattr(collectives, "allgather_hidden_add_rmsnorm", None),
     )
 
 
@@ -872,6 +876,32 @@ def all_gather_hidden(input: torch.Tensor, group: GroupCoordinator) -> torch.Ten
         return symm_out.view(p, t, hp).movedim(0, 1).reshape(t, p * hp)
 
     return group.all_gather(input, dim=-1)
+
+
+def all_gather_hidden_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    norm,
+    group: GroupCoordinator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather [T,H/P], add residual, and RMS-normalize the gathered tensor."""
+    deepsymm_group = _deepsymm_group(group, input)
+    fused = _deepsymm_collectives()[11]
+    if (
+        _INKLING_DEEPSYMM_HIDDEN_ALLGATHER_NORM
+        and deepsymm_group is not None
+        and fused is not None
+    ):
+        return fused(
+            input.contiguous(),
+            residual,
+            norm.weight,
+            deepsymm_group,
+            eps=norm.variance_epsilon,
+            fallback=False,
+        )
+    gathered = all_gather_hidden(input, group)
+    return norm(gathered, residual)
 
 
 @functools.cache
