@@ -741,14 +741,21 @@ async def async_request_sglang_generate(
                                     "cached_tokens_details"
                                 )
 
-                            if "text" in data and data["text"]:
+                            output_ids = data.get("output_ids") or []
+                            has_token_output = bool(data.get("text")) or bool(
+                                output_ids
+                            )
+                            if has_token_output:
                                 timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                                if data.get("text"):
+                                    generated_text = data["text"]
+                                output_len = _meta_info.get(
+                                    "completion_tokens", len(output_ids)
+                                )
 
                                 # First token
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
