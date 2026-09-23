@@ -61,7 +61,7 @@ _INKLING_AR_SSCONV_OUT_REGION = 16384 * 6144  # max_prefill_tokens x hidden
 # with it the custom kernels) is only taken for these.
 _INKLING_AR_WORLD_SIZES = (4, 6, 8)
 
-_INKLING_DEEPSYMM_ALLREDUCE = os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "0") != "0"
+_INKLING_DEEPSYMM_ALLREDUCE = os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "1") != "0"
 _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
 )
