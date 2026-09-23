@@ -1300,6 +1300,7 @@ def ar_scattered_sconv_fused(
 # full-width causal_conv1d + update_sconv_cache} beats the fused kernel.
 # The threshold is part of the producer/consumer contract.
 _INKLING_AR_FW_MIN_TOKENS = 3072
+_INKLING_DEEPSYMM_AR_FW_MIN_TOKENS = 4096
 
 
 def fullwidth_ar_sconv_fusable(
@@ -1318,18 +1319,16 @@ def fullwidth_ar_sconv_fusable(
     scattered flag."""
     is_xpu = torch.xpu.is_available() and not is_cuda()
     if is_xpu:
-        if not _INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV:
+        if not (_INKLING_DEEPSYMM_ALLREDUCE and _INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV):
             return False
         if torch.xpu.is_current_stream_capturing():
             return False
-        track_mask = getattr(forward_batch, "mamba_track_mask", None)
-        if track_mask is not None and track_mask.numel() != 0:
-            return False
     elif not is_cuda():
         return False
-    if not (
-        not get_exec().comm.enable_scattered_sconv
-        and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
+    if get_exec().comm.enable_scattered_sconv:
+        return False
+    if not is_xpu and not (
+        envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):
         return False
@@ -1340,7 +1339,9 @@ def fullwidth_ar_sconv_fusable(
         return False  # verify needs the window save (need_scratch); v5 covers it
     if not fm.is_extend():
         return False
-    min_tokens = 8192 if is_xpu else _INKLING_AR_FW_MIN_TOKENS
+    min_tokens = (
+        _INKLING_DEEPSYMM_AR_FW_MIN_TOKENS if is_xpu else _INKLING_AR_FW_MIN_TOKENS
+    )
     if num_tokens < min_tokens:
         return False
     if is_xpu:
@@ -1395,7 +1396,8 @@ def ar_fullwidth_sconv_fused(
     ``fullwidth_ar_sconv_fusable``. Returns the gathered post-conv [T, H]
     (a view of the OUT symm region); the caller runs the norm unfused (the
     in-kernel tail is slower at extend shapes, see
-    ``ar_scattered_sconv_fused``)."""
+    ``ar_scattered_sconv_fused``). Prefix-cache tracking snapshots are also
+    written while the reduced pre-convolution rows remain available."""
     if input.device.type == "xpu":
         shared = take_ar_shared(input.shape[0])
         if shared is not None:
@@ -1414,10 +1416,6 @@ def ar_fullwidth_sconv_fused(
             track_mask,
             track_dst,
         ) = sconv.extend_fused_ar_inputs(forward_batch)
-        if track_rows.numel() or track_mask.numel() or track_dst.numel():
-            raise RuntimeError(
-                "DeepSymm full-width fusion does not support prefix tracking"
-            )
         return _deepsymm_collectives()[6](
             input.contiguous(),
             sconv_cache,
@@ -1430,6 +1428,9 @@ def ar_fullwidth_sconv_fused(
             cache_indices.to(torch.int32),
             has_initial_state,
             group.device_group,
+            track_rows=track_rows,
+            track_mask=track_mask,
+            track_indices=track_dst,
             activation=sconv.activation,
             use_residual=sconv.use_residual,
         )
