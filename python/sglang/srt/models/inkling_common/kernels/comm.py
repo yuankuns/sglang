@@ -924,10 +924,13 @@ def all_gather_hidden_add_rmsnorm(
     """Gather [T,H/P], add residual, and RMS-normalize the gathered tensor."""
     deepsymm_group = _deepsymm_group(group, input)
     fused = _deepsymm_collectives()[11]
+    # Large BF16 prefill rows need sgl_kernel's reduction order: the DeepSymm
+    # single-kernel norm differs by one ULP and changes fixed TP4 tokens.
     if (
         _INKLING_DEEPSYMM_HIDDEN_ALLGATHER_NORM
         and deepsymm_group is not None
         and fused is not None
+        and (input.dtype != torch.bfloat16 or input.shape[0] <= 256)
     ):
         return fused(
             input.contiguous(),
