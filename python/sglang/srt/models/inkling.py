@@ -63,6 +63,8 @@ from sglang.srt.models.inkling_common.kernels.comm import (
     ensure_inkling_deepsymm_graph_resources,
     fullwidth_ar_sconv_fusable,
     scattered_ar_sconv_fusable,
+    symm_mem_all_reduce,
+    take_ar_shared,
 )
 from sglang.srt.models.inkling_common.moe import InklingMoE
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
@@ -375,7 +377,11 @@ class InklingDecoderLayer(nn.Module):
             forward_batch.out_cache_loc = orig_out_cache_loc[: hs.shape[0]]
             with force_eager_attention():
                 hs = self.attn(
-                    hs, positions, forward_batch, log_scaling_tau=log_scaling_tau
+                    hs,
+                    positions,
+                    forward_batch,
+                    log_scaling_tau=log_scaling_tau,
+                    reduce=not fuse_attn_ar,
                 )
             forward_batch.out_cache_loc = orig_out_cache_loc
         else:
@@ -408,6 +414,8 @@ class InklingDecoderLayer(nn.Module):
         residual_out: torch.Tensor,
         prev_mlp_sconv: Optional[ShortConvolution],
         log_scaling_tau: Optional[torch.Tensor],
+        prev_mlp_partial: bool = False,
+        fuse_attn_ar: bool = False,
     ) -> None:
         """Eager break: run `_attn_block` on the REAL (non-padded) tokens with the LIVE
         forward_batch and write the result into the padded output buffers. Mutates
@@ -415,16 +423,51 @@ class InklingDecoderLayer(nn.Module):
         per-tensor, not per-tuple, so outputs must be pre-allocated buffers)."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
         n = forward_batch.global_num_token_non_padded_cpu
+        hs_in = hidden_states[:n]
+        res_in = residual[:n] if residual is not None else None
+        prev_fused = prev_mlp_partial and fullwidth_ar_sconv_fusable(
+            get_tensor_model_parallel_group(),
+            forward_batch,
+            n,
+            hs_in.shape[-1],
+            hs_in.dtype,
+        )
+        if prev_mlp_partial and not prev_fused:
+            # The captured MoE still produces partials when a replay has
+            # fewer real tokens than its capture bucket. Reduce those rows
+            # before the ordinary SConv consumer.
+            hs_in = symm_mem_all_reduce(
+                hs_in,
+                get_tensor_model_parallel_group(),
+                shared=take_ar_shared(n),
+            )
+        attn_fused = fuse_attn_ar and fullwidth_ar_sconv_fusable(
+            self.attn_tp_group,
+            forward_batch,
+            n,
+            hs_in.shape[-1],
+            hs_in.dtype,
+        )
         # log_scaling_tau is per-token, so narrow it to match the real tokens too.
         hs, res = self._attn_block(
-            hidden_states[:n],
-            residual[:n] if residual is not None else None,
+            hs_in,
+            res_in,
             positions[:n],
             forward_batch,
             prev_mlp_sconv,
             log_scaling_tau[:n] if log_scaling_tau is not None else None,
             eager_attn=True,
+            prev_mlp_partial=prev_fused,
+            fuse_attn_ar=attn_fused,
         )
+        if fuse_attn_ar:
+            if attn_fused:
+                hs = ar_fullwidth_sconv_fused(
+                    hs, self.attn_sconv, forward_batch, self.attn_tp_group
+                )
+            # The captured segment consumes normalized hidden states. Keep
+            # this norm in the eager break for both fused and smaller replays.
+            hs, res = self.mlp_norm(hs, res)
         torch._foreach_copy_((attn_out[:n], residual_out[:n]), (hs, res))
         if attn_out.shape[0] != n:
             torch._foreach_zero_((attn_out[n:], residual_out[n:]))
@@ -434,12 +477,36 @@ class InklingDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor,
+        prev_mlp_partial: bool = False,
     ) -> None:
         """Eager break for the final layer's deferred mlp_sconv: run on the real
         tokens with the live forward_batch, write the padded output buffer."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
         n = forward_batch.global_num_token_non_padded_cpu
-        y = self.mlp_sconv(hidden_states[:n], positions[:n], forward_batch)
+        hs = hidden_states[:n]
+        if prev_mlp_partial:
+            if fullwidth_ar_sconv_fusable(
+                get_tensor_model_parallel_group(),
+                forward_batch,
+                n,
+                hs.shape[-1],
+                hs.dtype,
+            ):
+                y = ar_fullwidth_sconv_fused(
+                    hs,
+                    self.mlp_sconv,
+                    forward_batch,
+                    get_tensor_model_parallel_group(),
+                )
+            else:
+                hs = symm_mem_all_reduce(
+                    hs,
+                    get_tensor_model_parallel_group(),
+                    shared=take_ar_shared(n),
+                )
+                y = self.mlp_sconv(hs, positions[:n], forward_batch)
+        else:
+            y = self.mlp_sconv(hs, positions[:n], forward_batch)
         if self.scattered_sconv:
             # y is the [n, H/P] shard; the output buffer is post-gather [n, H].
             y = all_gather_hidden(y, self.attn_tp_group)
@@ -485,11 +552,8 @@ class InklingDecoderLayer(nn.Module):
             is_in_breakable_cuda_graph()
             and get_tc_piecewise_forward_context() is not None
         ):
-            # BCG prefill path: the AR fusion is decode-only, so partials never
-            # reach (or leave) this branch.
-            assert not prev_mlp_partial and not fuse_ar_sconv and not fuse_attn_ar
             # BCG: {prev mlp_sconv, attn_norm, attn, attn_sconv} run eagerly (one
-            # break under capture); mlp_norm + MoE stay captured. (The live
+            # break under capture); MoE stays captured. (The live
             # forward_batch inside the break is read from the shared tc_piecewise
             # context, which the prefill BCG runner populates at capture and replay.)
             # Under scattered sconv the group's INPUT can be the previous layer's
@@ -506,11 +570,21 @@ class InklingDecoderLayer(nn.Module):
                 residual_out,
                 prev_mlp_sconv,
                 log_scaling_tau,
+                prev_mlp_partial,
+                fuse_attn_ar and self.attn_sconv is not None,
             )
-            hidden_states, residual = self.mlp_norm(attn_out, residual_out)
+            if fuse_attn_ar and self.attn_sconv is not None:
+                hidden_states, residual = attn_out, residual_out
+            else:
+                hidden_states, residual = self.mlp_norm(attn_out, residual_out)
             del attn_out
             del residual_out
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+            if fuse_ar_sconv and self.mlp_ar_fusable:
+                hidden_states = self.mlp(
+                    hidden_states, forward_batch=forward_batch, reduce=False
+                )
+            else:
+                hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
             return hidden_states, residual
 
         # Plain eager / decode: run inline (still deferring mlp_sconv so the
@@ -896,7 +970,11 @@ class InklingCausalLLM(nn.Module):
                     if self._dflash_layers_to_capture
                     else hidden_states
                 )
-            if prev_mlp_partial:
+            bcg_prefill = (
+                is_in_breakable_cuda_graph()
+                and get_tc_piecewise_forward_context() is not None
+            )
+            if prev_mlp_partial and not bcg_prefill:
                 fm = forward_batch.forward_mode
                 if fm.is_decode() or fm.is_target_verify():
                     # Fused tail: {AR -> final mlp_sconv -> final norm} in one
@@ -945,7 +1023,7 @@ class InklingCausalLLM(nn.Module):
                 )
                 mlp_sconv_out = hidden_states.new_empty(out_shape)
                 self.layers[-1]._breakable_mlp_sconv(
-                    hidden_states, positions, mlp_sconv_out
+                    hidden_states, positions, mlp_sconv_out, prev_mlp_partial
                 )
                 hidden_states = mlp_sconv_out
             else:

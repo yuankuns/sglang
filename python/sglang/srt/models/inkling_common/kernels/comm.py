@@ -1327,6 +1327,11 @@ _INKLING_AR_FW_MIN_TOKENS = 3072
 _INKLING_DEEPSYMM_AR_FW_MIN_TOKENS = 4096
 
 
+@functools.cache
+def _report_deepsymm_fullwidth_hit(tokens: int, hidden: int) -> None:
+    print(f"[deepsymm-fullwidth] shape=({tokens}, {hidden})", flush=True)
+
+
 def fullwidth_ar_sconv_fusable(
     group: GroupCoordinator,
     forward_batch,
@@ -1423,6 +1428,11 @@ def ar_fullwidth_sconv_fused(
     ``ar_scattered_sconv_fused``). Prefix-cache tracking snapshots are also
     written while the reduced pre-convolution rows remain available."""
     if input.device.type == "xpu":
+        if (
+            os.getenv("INKLING_VERIFY_DEEPSYMM_FUSE") == "1"
+            and group.rank_in_group == 0
+        ):
+            _report_deepsymm_fullwidth_hit(input.shape[0], input.shape[1])
         shared = take_ar_shared(input.shape[0])
         if shared is not None:
             input = input + shared

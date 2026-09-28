@@ -43,6 +43,12 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.inkling_common.dense_mlp import (
     InklingBatchDenseMLP,
@@ -1110,6 +1116,17 @@ class InklingMoE(nn.Module):
         if not reduce:
             if shared_out is not None:
                 if self._fused_ar_shared:
+                    if (
+                        out.is_xpu
+                        and is_in_breakable_cuda_graph()
+                        and get_tc_piecewise_forward_context() is not None
+                    ):
+                        # The MoE executes in a captured segment while its
+                        # fused-AR consumer replays eagerly. Put shared into
+                        # that segment's tensor output so replay carries it
+                        # across the break; a Python stash exists only during
+                        # capture and would be empty on later replays.
+                        return out + shared_out
                     # Hand the shared partials to the consuming fused-AR call
                     # (register fold in the decode/verify kernels; pre-add in
                     # the scattered/extend consumers) -- deletes the separate
