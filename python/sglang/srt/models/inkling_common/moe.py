@@ -400,6 +400,44 @@ class InklingGate(nn.Module):
         routed_weights, topk_indices, shared_gammas, packed_topk_ids = gate_output
         return routed_weights, topk_indices, shared_gammas, packed_topk_ids
 
+    def _can_use_main_xpu_gate(self, x: torch.Tensor) -> bool:
+        return (
+            envs.SGLANG_INKLING_MAIN_MOE_GATE_KERNEL.get()
+            and is_xpu()
+            and x.device.type == "xpu"
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and tuple(x.shape) == (4096, _INKLING_GATE_GEMV_HIDDEN)
+            and x.is_contiguous()
+            and tuple(self.weight.shape)
+            == (_INKLING_FUSED_GATE_OUT_FEATURES_PADDED, _INKLING_GATE_GEMV_HIDDEN)
+            and self.weight.dtype == torch.bfloat16
+            and self.n_routed_experts == 256
+            and self.n_shared_experts == 2
+            and self.topk == 6
+            and self.gate_activation == "sigmoid"
+            and self.norm_after_topk
+            and self.global_scale is not None
+            and self.bias is not None
+        )
+
+    def forward_main_xpu(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        from sgl_kernel import (
+            inkling_moe_gate_projection,
+            inkling_moe_gate_topk_renorm,
+        )
+
+        logits = inkling_moe_gate_projection(x, self.weight)
+        return inkling_moe_gate_topk_renorm(
+            logits,
+            self.bias,
+            self.global_scale,
+            self.route_scale,
+            return_packed=self.emit_packed_topk,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -407,8 +445,12 @@ class InklingGate(nn.Module):
         # R3 (rollout routing replay) needs the plain [T, K] topk indices captured on
         # the standard path; the fused kernel's packed output never exposes them, so
         # bypass the fused shortcut whenever an experts capturer is active.
+        capturer = get_global_experts_capturer()
+        if capturer is None and self._can_use_main_xpu_gate(x):
+            return self.forward_main_xpu(x)
+
         if (
-            get_global_experts_capturer() is None
+            capturer is None
             and envs.SGLANG_OPT_USE_FUSED_GATE_TOPK.get()
             and self.n_total_experts == _INKLING_FUSED_GATE_OUT_FEATURES
             and self.gate_activation == "sigmoid"

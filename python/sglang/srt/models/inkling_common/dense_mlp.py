@@ -1,11 +1,11 @@
 import logging
-import os
 from enum import Enum
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -16,6 +16,7 @@ from sglang.srt.models.inkling_common.kernels.comm import (
 )
 from sglang.srt.models.inkling_common.util import (
     FusedMoELoadingMixin,
+    deinterleave_gate_up,
     lora_compatible_layout_enabled,
 )
 from sglang.srt.models.llama import LlamaMLP
@@ -125,31 +126,52 @@ class InklingDenseMLP(LlamaMLP):
         self.layer_id = layer_id
         self.act_fn = InklingSwiglu(interleaved=fused)
         self.scattered_sconv = get_exec().comm.enable_scattered_sconv
-        self.register_buffer("_gate_up_weight_t", None, persistent=False)
-        self.register_buffer("_down_weight_t", None, persistent=False)
+        self.register_buffer("_gate_up_weight_packed", None, persistent=False)
+        self.register_buffer("_down_weight_packed", None, persistent=False)
 
     def prepare_inkling_dense_gemm(self) -> None:
         """Prepare immutable production-layout weights outside graph capture."""
-        # Keep opt-in until reduced-model E2E profiling shows a production win.
-        enabled = os.getenv("SGLANG_INKLING_DENSE_GEMM", "0") != "0"
         gate_weight = getattr(self.gate_up_proj, "weight", None)
         down_weight = getattr(self.down_proj, "weight", None)
         supported = (
-            enabled
+            envs.SGLANG_INKLING_MAIN_DENSE_KERNEL.get()
             and gate_weight is not None
             and down_weight is not None
             and gate_weight.device.type == "xpu"
             and gate_weight.dtype == torch.bfloat16
             and down_weight.dtype == torch.bfloat16
+            and tuple(gate_weight.shape) == (12288, 6144)
+            and tuple(down_weight.shape) == (6144, 6144)
             and self.gate_up_proj.bias is None
             and self.down_proj.bias is None
+            and self.act_fn.interleaved
         )
         if not supported:
-            self._gate_up_weight_t = None
-            self._down_weight_t = None
+            self._gate_up_weight_packed = None
+            self._down_weight_packed = None
             return
-        self._gate_up_weight_t = gate_weight.t().contiguous()
-        self._down_weight_t = down_weight.t().contiguous()
+        from sgl_kernel import (
+            repack_inkling_down_weight,
+            repack_inkling_gate_up_weight,
+        )
+
+        # Checkpoint rows are [gate0, up0, ...]; the repacker consumes
+        # conventional [gate..., up...]. This is the only conversion and runs
+        # after loading, before any graph capture.
+        gate_major = deinterleave_gate_up(gate_weight, dim=0)
+        self._gate_up_weight_packed = repack_inkling_gate_up_weight(gate_major)
+        self._down_weight_packed = repack_inkling_down_weight(down_weight)
+
+    def _can_use_main_xpu_dense(self, x: torch.Tensor) -> bool:
+        return (
+            self._gate_up_weight_packed is not None
+            and self._down_weight_packed is not None
+            and x.device.type == "xpu"
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and tuple(x.shape) == (4096, 6144)
+            and x.is_contiguous()
+        )
 
     def forward(
         self,
@@ -157,22 +179,13 @@ class InklingDenseMLP(LlamaMLP):
         forward_batch: ForwardBatch | None = None,
         use_reduce_scatter: bool = False,
     ):
-        if self._gate_up_weight_t is not None:
-            from sgl_kernel import inkling_dense_gemm
+        if self._can_use_main_xpu_dense(x):
+            from sgl_kernel import inkling_down, inkling_gate_up
 
-            # The tuned kernel wins for the mid-M gate/up shapes, while oneDNN
-            # remains faster for decode and the 4096-token packed-stride case.
-            if 32 < x.shape[0] <= 1024:
-                gate_up = inkling_dense_gemm(x, self._gate_up_weight_t)
-            else:
-                gate_up, _ = self.gate_up_proj(x)
-            x = self.act_fn(gate_up)
-            # Down projection wins materially once there is enough M work;
-            # decode is within noise and avoids custom-op launch overhead.
-            if x.shape[0] > 32:
-                x = inkling_dense_gemm(x, self._down_weight_t)
-            else:
-                x, _ = self.down_proj(x)
+            # inkling_gate_up includes SwiGLU. Packed weights are persistent
+            # buffers prepared by load_weights; forward performs no repacking.
+            x = inkling_gate_up(x, self._gate_up_weight_packed)
+            x = inkling_down(x, self._down_weight_packed)
         else:
             x = super().forward(x, forward_batch)
         if self.global_scale is not None:

@@ -60,6 +60,7 @@ from sglang.srt.models.inkling_common.kernels.comm import (
     ar_sconv_norm_fusable,
     ar_sconv_norm_fused,
     ensure_inkling_ar_resources,
+    ensure_inkling_deepsymm_graph_resources,
     fullwidth_ar_sconv_fusable,
     scattered_ar_sconv_fusable,
 )
@@ -629,6 +630,13 @@ class InklingCausalLLM(nn.Module):
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
             ensure_inkling_ar_resources(get_tensor_model_parallel_group())
             ensure_inkling_ar_resources(get_parallel().attn_tp_group)
+        if torch.xpu.is_available():
+            ensure_inkling_deepsymm_graph_resources(
+                get_tensor_model_parallel_group(),
+                config.hidden_size,
+                torch.bfloat16,
+                8192,
+            )
 
         # Warm the fused decode {AR -> mlp_sconv -> norm} JIT module (both
         # track variants) so the first fused call -- which can land inside a

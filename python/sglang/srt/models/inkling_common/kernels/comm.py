@@ -62,6 +62,9 @@ _INKLING_AR_SSCONV_OUT_REGION = 16384 * 6144  # max_prefill_tokens x hidden
 _INKLING_AR_WORLD_SIZES = (4, 6, 8)
 
 _INKLING_DEEPSYMM_ALLREDUCE = os.getenv("SGLANG_INKLING_DEEPSYMM_ALLREDUCE", "1") != "0"
+_INKLING_DEEPSYMM_DECODE_ONLY = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_DECODE_ONLY", "0") != "0"
+)
 _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM", "1") != "0"
 )
@@ -73,6 +76,9 @@ _INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV = (
 )
 _INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_SCATTERED_SCONV_NORM", "0") != "0"
+)
+_INKLING_DEEPSYMM_FUSED_SCATTERED_SHARED = (
+    os.getenv("SGLANG_INKLING_DEEPSYMM_FUSED_SCATTERED_SHARED", "1") != "0"
 )
 _INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV = (
     os.getenv("SGLANG_INKLING_DEEPSYMM_FULLWIDTH_AR_SCONV", "1") != "0"
@@ -143,6 +149,7 @@ def _deepsymm_group(group: GroupCoordinator, input: torch.Tensor):
     if (
         input.device.type != "xpu"
         or not _INKLING_DEEPSYMM_ALLREDUCE
+        or _INKLING_DEEPSYMM_DECODE_ONLY
         or torch.xpu.is_current_stream_capturing()
     ):
         return None
@@ -247,6 +254,26 @@ def ensure_inkling_ar_resources(group: GroupCoordinator) -> None:
         _get_inkling_ar_resources(comm)
 
 
+def ensure_inkling_deepsymm_graph_resources(
+    group: GroupCoordinator,
+    hidden: int,
+    dtype: torch.dtype,
+    max_prefill_tokens: int,
+) -> None:
+    """Prepare decode AR-fusion resources before XPU command-graph capture."""
+    if not torch.xpu.is_available() or not _INKLING_DEEPSYMM_ALLREDUCE:
+        return
+    from deep_symm.collectives import initialize_allreduce_resources
+
+    initialize_allreduce_resources(
+        group.device_group,
+        numel=hidden,
+        dtype=dtype,
+        device=torch.device("xpu", torch.xpu.current_device()),
+        reserve_numel=max_prefill_tokens * hidden,
+    )
+
+
 def _v4_enabled(comm, num_tokens: int) -> bool:
     if not is_cuda():
         return False
@@ -301,7 +328,7 @@ def ar_sconv_norm_fusable(
     """True when a decode {all-reduce -> sconv -> add+RMSNorm} chain
     (attn-side: wo_ud AR -> attn_sconv -> mlp_norm; MoE-side: MoE AR ->
     mlp_sconv -> next attn_norm)
-    can run as the single fused kernel
+    can run as the fused chain
     (kernels/ops/communication/inkling_ar_fused.py). Must be
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
@@ -313,17 +340,15 @@ def ar_sconv_norm_fusable(
             fm.is_decode()
             and _INKLING_DEEPSYMM_ALLREDUCE
             and _INKLING_DEEPSYMM_FUSED_AR_SCONV_NORM
+            # TP8 spans two sockets. Its decode ring remains slower than the
+            # oneCCL path selected by the unfused graph on this platform.
+            and group.world_size != 8
         )
         return (
             mode_enabled
             and not get_exec().comm.enable_scattered_sconv
             and (fm.is_decode() or fm.is_target_verify())
-            and (
-                not fm.is_decode()
-                or getattr(forward_batch, "mamba_track_mask", None) is None
-            )
             and (not fm.is_target_verify() or _deepsymm_collectives()[5] is not None)
-            and not torch.xpu.is_current_stream_capturing()
             and dtype == torch.bfloat16
             and group.world_size > 1
             and 0 < num_tokens <= 256
@@ -375,8 +400,8 @@ def ar_sconv_norm_fused(
     group: GroupCoordinator,
     shared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused decode {all-reduce -> sconv -> residual-add + RMSNorm}: one kernel
-    replacing ``symm_mem_all_reduce`` + ``fused_causal_conv1d_update_decode`` +
+    """Fused decode {all-reduce -> sconv -> residual-add + RMSNorm}: replaces
+    ``symm_mem_all_reduce`` + ``fused_causal_conv1d_update_decode`` +
     the fused-add RMSNorm. ``input`` holds the UNREDUCED MoE partial sums
     (``InklingMoE.forward(reduce=False)``); returns ``(hs, residual)`` exactly like
     the unfused ``sconv -> norm(hs, res)`` chain. The caller must have checked
@@ -424,6 +449,8 @@ def ar_sconv_norm_fused(
             activation=sconv.activation,
             use_residual=sconv.use_residual,
             shared=shared,
+            track_mask=forward_batch.mamba_track_mask,
+            track_indices=forward_batch.mamba_track_indices,
         )
 
     comm = group.torch_symm_mem_comm
@@ -929,7 +956,6 @@ def scattered_ar_sconv_fusable(
             and _INKLING_DEEPSYMM_FUSED_AR_SCATTERED_SCONV
             and get_exec().comm.enable_scattered_sconv
             and forward_batch.forward_mode.is_decode()
-            and not torch.xpu.is_current_stream_capturing()
             and dtype == torch.bfloat16
             and group.world_size > 1
             and hidden % group.world_size == 0
@@ -1009,17 +1035,9 @@ def ar_scattered_sconv_fused(
     fusion only saves a launch. Decode prefix-cache tracking is fused (post-update window
     snapshot), so tracked decode batches are supported."""
     shared = take_ar_shared(input.shape[0])
-    if shared is not None:
-        # Pre-add on this path rather than folding in-kernel: pre-add keeps the
-        # full-occupancy torch.add instead of the barrier-capped grid.
-        # Add straight into the AR buffer -- the same single kernel the
-        # producer used to run, and the stage-in copy below then no-ops.
-        _buf = get_ar_buffer(group, input.shape[0], input.shape[1], input.dtype)
-        if _buf is not None:
-            torch.add(input, shared, out=_buf)
-            input = _buf
-        else:
-            input = input + shared
+    if shared is not None and not _INKLING_DEEPSYMM_FUSED_SCATTERED_SHARED:
+        input = input + shared
+        shared = None
 
     if input.device.type == "xpu":
         world = group.world_size
@@ -1029,6 +1047,11 @@ def ar_scattered_sconv_fused(
             forward_batch
         )
         rank_major = input.view(t, world, hc).movedim(1, 0).contiguous()
+        shared_rank_major = (
+            shared.view(t, world, hc).movedim(1, 0).contiguous()
+            if shared is not None
+            else None
+        )
         track_mask = getattr(forward_batch, "mamba_track_mask", None)
         track_indices = getattr(forward_batch, "mamba_track_indices", None)
         if track_mask is not None:
@@ -1054,6 +1077,7 @@ def ar_scattered_sconv_fused(
             track_indices=track_indices,
             residual=norm_residual.view(-1) if fuse_norm else None,
             norm_weight=norm.weight.data if fuse_norm else None,
+            shared=shared_rank_major,
             eps=float(norm.variance_epsilon) if fuse_norm else 1e-6,
         )
         if fuse_norm:

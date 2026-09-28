@@ -1417,6 +1417,10 @@ class Envs:
     # ===================================================================
     # Inkling
     # ===================================================================
+    # Opt in to the main@5ffde600 XPU BF16 kernels. These remain disabled until
+    # the matching sgl-kernel wheel is installed and TP4 E2E validation passes.
+    SGLANG_INKLING_MAIN_DENSE_KERNEL = EnvBool(False)
+    SGLANG_INKLING_MAIN_MOE_GATE_KERNEL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
     # Inside the fused gate: use the CUDA JIT top-k+renorm kernel (v2) instead
     # of the triton kernel when the production Inkling shape applies.
