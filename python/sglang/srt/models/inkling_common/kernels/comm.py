@@ -266,10 +266,17 @@ def ensure_inkling_deepsymm_graph_resources(
     from deep_symm.collectives import initialize_allreduce_resources
 
     graph_tokens = (1,)
-    if group.world_size == 4 and hidden == 6144 and os.getenv(
-        "RING_VERIFY_DIRECT", "1"
-    ) != "0":
+    if (
+        group.world_size == 4
+        and hidden == 6144
+        and os.getenv("RING_VERIFY_DIRECT", "1") != "0"
+    ):
         graph_tokens += (2, 4)
+        if (
+            os.getenv("RING_VERIFY_PACKET", "1") != "0"
+            or os.getenv("RING_VERIFY_DIRECT_BATCH2", "0") != "0"
+        ):
+            graph_tokens += (8,)
     for tokens in graph_tokens:
         initialize_allreduce_resources(
             group.device_group,
