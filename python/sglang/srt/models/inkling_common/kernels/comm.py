@@ -260,18 +260,24 @@ def ensure_inkling_deepsymm_graph_resources(
     dtype: torch.dtype,
     max_prefill_tokens: int,
 ) -> None:
-    """Prepare decode AR-fusion resources before XPU command-graph capture."""
+    """Prepare decode and small verify AR resources before XPU graph capture."""
     if not torch.xpu.is_available() or not _INKLING_DEEPSYMM_ALLREDUCE:
         return
     from deep_symm.collectives import initialize_allreduce_resources
 
-    initialize_allreduce_resources(
-        group.device_group,
-        numel=hidden,
-        dtype=dtype,
-        device=torch.device("xpu", torch.xpu.current_device()),
-        reserve_numel=max_prefill_tokens * hidden,
-    )
+    graph_tokens = (1,)
+    if group.world_size == 4 and hidden == 6144 and os.getenv(
+        "RING_VERIFY_DIRECT", "1"
+    ) != "0":
+        graph_tokens += (2, 4)
+    for tokens in graph_tokens:
+        initialize_allreduce_resources(
+            group.device_group,
+            numel=tokens * hidden,
+            dtype=dtype,
+            device=torch.device("xpu", torch.xpu.current_device()),
+            reserve_numel=max_prefill_tokens * hidden,
+        )
 
 
 def _v4_enabled(comm, num_tokens: int) -> bool:
